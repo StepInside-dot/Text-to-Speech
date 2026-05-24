@@ -1,331 +1,692 @@
-/**
- * VoxCap — script.js
- * Text-to-Speech with real-time word-by-word captioning
- * Uses the Web Speech API (SpeechSynthesis + SpeechSynthesisUtterance)
- */
+/* ================================================================
+   VoxCap Studio — style.css
+   Aesthetic: Precision broadcast workstation / audio instrument
+   Fonts: Syne (display) + IBM Plex Mono (data) + IBM Plex Sans (body)
+   ================================================================ */
 
-"use strict";
+/* ── Reset ── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-// ── DOM refs ──────────────────────────────────────────────────────────────────
-const textInput     = document.getElementById("text-input");
-const speakBtn      = document.getElementById("speak-btn");
-const btnIcon       = document.getElementById("btn-icon");
-const btnLabel      = document.getElementById("btn-label");
-const captionWord   = document.getElementById("caption-word");
-const captionIdle   = document.getElementById("caption-idle");
-const captionStage  = document.querySelector(".caption-stage");
-const stageDot      = document.getElementById("stage-dot");
-const stageStatus   = document.getElementById("stage-status");
-const progressFill  = document.getElementById("progress-fill");
-const voiceSelect   = document.getElementById("voice-select");
-const rateSlider    = document.getElementById("rate-slider");
-const pitchSlider   = document.getElementById("pitch-slider");
-const rateValue     = document.getElementById("rate-value");
-const pitchValue    = document.getElementById("pitch-value");
-const charCount     = document.getElementById("char-count");
+/* ── Design tokens ── */
+:root {
+  /* Palette — deep studio blacks + amber gold */
+  --bg:          #080a0d;
+  --bg-2:        #0d1017;
+  --bg-3:        #12161d;
+  --surface:     #161b24;
+  --surface-2:   #1c2230;
+  --surface-3:   #222b3a;
 
-// ── State ─────────────────────────────────────────────────────────────────────
-let voices        = [];
-let isSpeaking    = false;
-let totalChars    = 0;   // for progress estimation
+  --border:      rgba(255,255,255,0.06);
+  --border-md:   rgba(255,255,255,0.1);
+  --border-hi:   rgba(255,180,50,0.25);
 
-// ── Browser support check ─────────────────────────────────────────────────────
-if (!("speechSynthesis" in window)) {
-  const notice = document.createElement("p");
-  notice.className = "unsupported-notice visible";
-  notice.textContent =
-    "⚠️ Your browser does not support the Web Speech API. " +
-    "Please try Chrome, Edge, or Safari.";
-  speakBtn.insertAdjacentElement("afterend", notice);
-  speakBtn.disabled = true;
-  speakBtn.style.opacity = "0.4";
-  speakBtn.style.cursor  = "not-allowed";
+  --gold:        #ffb432;     /* primary accent — amber gold */
+  --gold-dim:    #c47e10;
+  --gold-glow:   rgba(255,180,50,0.18);
+  --red:         #ff4455;     /* recording/error */
+  --green:       #39e07a;     /* done/success */
+  --cyan:        #3dd8e8;     /* info accent */
+
+  --text:        #dce4f0;
+  --text-muted:  #5c6880;
+  --text-dim:    #2e3a4e;
+
+  /* Caption word */
+  --caption-color: #ffffff;
+
+  /* Typography */
+  --font-display: 'Syne', sans-serif;
+  --font-mono:    'IBM Plex Mono', monospace;
+  --font-body:    'IBM Plex Sans', sans-serif;
+
+  /* Geometry */
+  --r-sm: 4px;
+  --r-md: 8px;
+  --r-lg: 14px;
+  --r-xl: 20px;
 }
 
-// ── Load voices ───────────────────────────────────────────────────────────────
-/**
- * Voices load asynchronously in most browsers.
- * We call populateVoices immediately, and also on the voiceschanged event.
- */
-function populateVoices() {
-  voices = window.speechSynthesis.getVoices();
-  if (!voices.length) return;
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: var(--bg-2); }
+::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 2px; }
 
-  voiceSelect.innerHTML = "";
-
-  // Prefer English voices, but show all
-  const english = voices.filter(v => v.lang.startsWith("en"));
-  const others  = voices.filter(v => !v.lang.startsWith("en"));
-
-  const addGroup = (label, list) => {
-    if (!list.length) return;
-    const group = document.createElement("optgroup");
-    group.label = label;
-    list.forEach((voice, i) => {
-      const opt = document.createElement("option");
-      opt.value       = voice.name;
-      opt.textContent = `${voice.name} (${voice.lang})`;
-      // Default: pick first local English voice if available
-      if (voice.localService && voice.lang.startsWith("en") && !voiceSelect.value) {
-        opt.selected = true;
-      }
-      group.appendChild(opt);
-    });
-    voiceSelect.appendChild(group);
-  };
-
-  addGroup("English", english);
-  addGroup("Other Languages", others);
+/* ── Base ── */
+html { scroll-behavior: smooth; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.6;
+  min-height: 100dvh;
+  overflow-x: hidden;
 }
 
-populateVoices();
-if (window.speechSynthesis.onvoiceschanged !== undefined) {
-  window.speechSynthesis.onvoiceschanged = populateVoices;
+/* ── Scanlines ── */
+.scanlines {
+  position: fixed;
+  inset: 0;
+  background: repeating-linear-gradient(
+    to bottom,
+    transparent,
+    transparent 3px,
+    rgba(0,0,0,0.04) 3px,
+    rgba(0,0,0,0.04) 4px
+  );
+  pointer-events: none;
+  z-index: 9999;
+  opacity: 0.6;
 }
 
-// ── Character counter ─────────────────────────────────────────────────────────
-textInput.addEventListener("input", () => {
-  charCount.textContent = textInput.value.length;
-});
-
-// ── Slider labels ─────────────────────────────────────────────────────────────
-rateSlider.addEventListener("input", () => {
-  rateValue.textContent = parseFloat(rateSlider.value).toFixed(1) + "×";
-});
-pitchSlider.addEventListener("input", () => {
-  pitchValue.textContent = parseFloat(pitchSlider.value).toFixed(1);
-});
-
-// ── Caption helpers ───────────────────────────────────────────────────────────
-
-/** Show the idle placeholder */
-function showIdle() {
-  captionIdle.classList.remove("hidden");
-  captionWord.classList.remove("pop", "fade-out");
-  captionWord.textContent = "";
-  captionWord.style.opacity = "0";
+/* ── App container ── */
+.app {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 20px 60px;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
 }
 
-/**
- * Flash a word in the caption box.
- * We briefly fade out the old word, then pop in the new one.
- */
-function showWord(word) {
-  // Trim punctuation for display, keep it readable
-  const clean = word.replace(/[.,!?;:"""''\-–—()[\]{}<>]+$/, "")
-                     .replace(/^["""''\-–—()[\]{}<>]+/, "");
-  if (!clean) return;
-
-  captionIdle.classList.add("hidden");
-
-  // Remove existing animation classes
-  captionWord.classList.remove("pop", "fade-out");
-
-  // Force reflow so the animation restarts cleanly
-  void captionWord.offsetWidth;
-
-  captionWord.textContent = clean.toUpperCase();
-  captionWord.classList.add("pop");
+/* ════════════════════════════════
+   TOP BAR
+   ════════════════════════════════ */
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 0 16px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 28px;
+  position: sticky;
+  top: 0;
+  background: rgba(8,10,13,0.92);
+  backdrop-filter: blur(12px);
+  z-index: 100;
 }
 
-/** Update the linear progress bar based on charIndex position */
-function updateProgress(charIndex) {
-  if (!totalChars) return;
-  const pct = Math.min((charIndex / totalChars) * 100, 100);
-  progressFill.style.width = pct + "%";
+.topbar-left { display: flex; align-items: center; gap: 12px; }
+
+.topbar-logo {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--font-display);
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--text);
+}
+.topbar-logo svg { color: var(--gold); flex-shrink: 0; }
+
+.topbar-version {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  background: var(--surface);
+  border: 1px solid var(--border-md);
+  padding: 2px 7px;
+  border-radius: 3px;
+  letter-spacing: 0.08em;
 }
 
-/** Set UI to LIVE (speaking) state */
-function setStateLive() {
-  isSpeaking = true;
-  speakBtn.classList.add("speaking");
-  btnIcon.textContent  = "■";
-  btnLabel.textContent = "Stop";
-  stageDot.className   = "stage-dot live";
-  stageStatus.textContent = "LIVE";
-  captionStage.classList.add("active");
-  progressFill.style.width = "0%";
+/* Status indicator */
+.status-indicator {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  color: var(--text-muted);
+}
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  transition: background 0.3s, box-shadow 0.3s;
+}
+.status-dot.live {
+  background: var(--red);
+  box-shadow: 0 0 8px rgba(255,68,85,0.9);
+  animation: blink 1s ease-in-out infinite;
+}
+.status-dot.done {
+  background: var(--green);
+  box-shadow: 0 0 8px rgba(57,224,122,0.7);
+  animation: none;
+}
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
+
+/* ════════════════════════════════
+   MAIN GRID
+   ════════════════════════════════ */
+.main-grid {
+  display: grid;
+  grid-template-columns: 380px 1fr;
+  gap: 20px;
+  align-items: start;
 }
 
-/** Set UI to IDLE (stopped/finished) state */
-function setStateIdle(label = "Ready") {
-  isSpeaking = false;
-  speakBtn.classList.remove("speaking");
-  btnIcon.textContent  = "▶";
-  btnLabel.textContent = "Speak";
-  stageDot.className   = "stage-dot";
-  stageStatus.textContent = label;
-  captionStage.classList.remove("active");
+.col-left, .col-right {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
 }
 
-/** Set UI to DONE (finished naturally) state */
-function setStateDone() {
-  isSpeaking = false;
-  speakBtn.classList.remove("speaking");
-  btnIcon.textContent  = "▶";
-  btnLabel.textContent = "Speak";
-  stageDot.className   = "stage-dot done";
-  stageStatus.textContent = "Done";
-  captionStage.classList.remove("active");
-  progressFill.style.width = "100%";
+/* ════════════════════════════════
+   PANEL
+   ════════════════════════════════ */
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+  position: relative;
+}
+.panel::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent 5%, var(--border-md) 40%, transparent 95%);
 }
 
-// ── Core TTS logic ────────────────────────────────────────────────────────────
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-3);
+}
 
-/**
- * extractWordAtCharIndex
- *
- * The Web Speech API's `boundary` event provides `charIndex`, the position in
- * the original string where the upcoming word starts. We walk forward from
- * that index to find the full word token.
- *
- * @param {string} text      - full input string
- * @param {number} charIndex - starting character index from boundary event
- * @returns {string}          the word token
- */
-function extractWordAtCharIndex(text, charIndex) {
-  // Walk forward from charIndex until we hit whitespace or end-of-string
-  let end = charIndex;
-  while (end < text.length && !/\s/.test(text[end])) {
-    end++;
+.panel-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  color: var(--gold);
+  text-transform: uppercase;
+}
+
+/* ════════════════════════════════
+   TEXT INPUT
+   ════════════════════════════════ */
+.char-counter {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  letter-spacing: 0.06em;
+}
+
+.text-input {
+  display: block;
+  width: 100%;
+  min-height: 170px;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: 14px;
+  font-weight: 300;
+  line-height: 1.75;
+  padding: 18px;
+  resize: vertical;
+  outline: none;
+  transition: background 0.2s;
+}
+.text-input::placeholder { color: var(--text-dim); }
+.text-input:focus { background: rgba(255,255,255,0.015); }
+
+/* ════════════════════════════════
+   SETTINGS
+   ════════════════════════════════ */
+.settings-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  padding: 18px;
+  padding-bottom: 4px;
+}
+
+.setting-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.setting-group.full-width { grid-column: 1 / -1; }
+
+.setting-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.setting-value {
+  color: var(--gold);
+  font-size: 10px;
+}
+
+/* Select */
+.select-wrap {
+  position: relative;
+}
+.setting-select {
+  width: 100%;
+  background: var(--surface-2);
+  border: 1px solid var(--border-md);
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: 13px;
+  padding: 8px 30px 8px 10px;
+  outline: none;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  transition: border-color 0.2s;
+}
+.setting-select:focus { border-color: var(--gold-dim); }
+.setting-select option { background: var(--surface-2); }
+
+.select-arrow {
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-muted);
+  font-size: 11px;
+  pointer-events: none;
+}
+
+/* Range slider */
+.slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 3px;
+  background: var(--surface-3);
+  border-radius: 100px;
+  outline: none;
+  cursor: pointer;
+  border: none;
+}
+.slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  background: var(--gold);
+  border: 2px solid var(--bg);
+  box-shadow: 0 0 8px rgba(255,180,50,0.5);
+  cursor: pointer;
+  transition: transform 0.15s, box-shadow 0.15s;
+}
+.slider::-moz-range-thumb {
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  background: var(--gold);
+  border: 2px solid var(--bg);
+  box-shadow: 0 0 8px rgba(255,180,50,0.5);
+  cursor: pointer;
+}
+.slider:hover::-webkit-slider-thumb {
+  transform: scale(1.25);
+  box-shadow: 0 0 14px rgba(255,180,50,0.85);
+}
+
+/* ════════════════════════════════
+   TRANSPORT CONTROLS
+   ════════════════════════════════ */
+.transport {
+  display: flex;
+  gap: 10px;
+  padding: 16px 18px 18px;
+}
+
+/* Buttons */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font-family: var(--font-display);
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  border: none;
+  border-radius: var(--r-md);
+  cursor: pointer;
+  padding: 11px 22px;
+  transition: transform 0.12s, box-shadow 0.15s, background 0.2s, opacity 0.2s;
+  text-transform: uppercase;
+}
+.btn:disabled { opacity: 0.35; cursor: not-allowed; pointer-events: none; }
+.btn:active:not(:disabled) { transform: scale(0.97); }
+
+.btn-icon { display: flex; align-items: center; }
+
+.btn-primary {
+  background: var(--gold);
+  color: #0a0800;
+  flex: 1;
+  box-shadow: 0 4px 20px rgba(255,180,50,0.3);
+}
+.btn-primary:hover:not(:disabled) {
+  background: #ffc84a;
+  box-shadow: 0 4px 28px rgba(255,180,50,0.55);
+  transform: translateY(-1px);
+}
+.btn-primary.playing {
+  background: var(--red);
+  color: #fff;
+  box-shadow: 0 4px 20px rgba(255,68,85,0.4);
+  animation: pulse-gold 1.8s ease-in-out infinite;
+}
+@keyframes pulse-gold {
+  0%,100% { box-shadow: 0 4px 20px rgba(255,68,85,0.4); }
+  50%      { box-shadow: 0 4px 36px rgba(255,68,85,0.75); }
+}
+
+.btn-secondary {
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border-md);
+}
+.btn-secondary:hover:not(:disabled) {
+  background: var(--surface-3);
+  border-color: var(--border-hi);
+}
+
+/* ════════════════════════════════
+   CAPTION PANEL
+   ════════════════════════════════ */
+.panel-caption { position: relative; }
+
+.rec-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  color: var(--text-dim);
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+.rec-badge.active {
+  color: var(--red);
+  opacity: 1;
+}
+.rec-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--red);
+  animation: blink 0.9s ease-in-out infinite;
+}
+
+/* Caption stage */
+.caption-stage {
+  min-height: 200px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 28px;
+  position: relative;
+  background:
+    radial-gradient(ellipse 60% 50% at 50% 50%, rgba(255,180,50,0.04) 0%, transparent 70%);
+}
+
+.caption-idle-msg {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  color: var(--text-dim);
+  font-size: 13px;
+  text-align: center;
+  transition: opacity 0.3s;
+}
+.caption-idle-msg.hidden { opacity: 0; pointer-events: none; }
+.caption-idle-msg svg { color: var(--text-dim); }
+
+/* The caption word display */
+.caption-display {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  opacity: 0;
+  transition: opacity 0.15s;
+  pointer-events: none;
+}
+.caption-display.visible { opacity: 1; }
+
+.caption-word-el {
+  font-family: var(--font-display);
+  font-size: clamp(48px, 7vw, 84px);
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  color: var(--caption-color);
+  text-align: center;
+  line-height: 1;
+  text-shadow:
+    0 0 60px rgba(255,180,50,0.35),
+    0 3px 0 rgba(0,0,0,0.9),
+    2px 2px 0 rgba(0,0,0,0.7);
+  animation: word-in 0.22s cubic-bezier(0.22,1.4,0.5,1) forwards;
+  word-break: break-word;
+  max-width: 100%;
+}
+
+@keyframes word-in {
+  from { opacity: 0; transform: scale(0.78) translateY(12px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+/* Progress */
+.progress-bar-wrap {
+  height: 2px;
+  background: var(--surface-2);
+  margin: 0 18px;
+}
+.progress-bar-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--gold-dim), var(--gold));
+  border-radius: 2px;
+  transition: width 0.25s linear;
+  box-shadow: 0 0 8px rgba(255,180,50,0.4);
+}
+
+/* Timing row */
+.timing-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 18px 14px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+.timing-label { color: var(--text-dim); letter-spacing: 0.1em; }
+.timing-value { color: var(--gold); letter-spacing: 0.06em; font-size: 11px; }
+
+/* ════════════════════════════════
+   CAPTION LOG
+   ════════════════════════════════ */
+.btn-clear {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 2px 5px;
+  border-radius: 3px;
+  transition: color 0.2s, background 0.2s;
+}
+.btn-clear:hover { color: var(--red); background: rgba(255,68,85,0.1); }
+
+.caption-log {
+  max-height: 180px;
+  overflow-y: auto;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.log-empty {
+  color: var(--text-dim);
+  font-size: 12px;
+  padding: 4px 0;
+}
+
+.log-entry {
+  display: grid;
+  grid-template-columns: 100px 1fr;
+  gap: 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--border);
+  animation: log-in 0.2s ease forwards;
+}
+@keyframes log-in {
+  from { opacity: 0; transform: translateX(-6px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+.log-ts { color: var(--gold-dim); flex-shrink: 0; }
+.log-word { color: var(--text); }
+
+/* ════════════════════════════════
+   DOWNLOAD SECTION
+   ════════════════════════════════ */
+.download-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px;
+}
+
+.download-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 14px 16px;
+  transition: border-color 0.2s;
+}
+.download-card.ready { border-color: rgba(255,180,50,0.2); }
+
+.download-card-icon {
+  color: var(--text-dim);
+  flex-shrink: 0;
+  transition: color 0.3s;
+}
+.download-card.ready .download-card-icon { color: var(--gold); }
+
+.download-card-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.download-card-title {
+  font-family: var(--font-display);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: var(--text);
+}
+.download-card-meta {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.btn-download {
+  background: var(--surface-2);
+  color: var(--text-muted);
+  border: 1px solid var(--border-md);
+  border-radius: var(--r-sm);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 7px 12px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  transition: background 0.2s, color 0.2s, border-color 0.2s, box-shadow 0.2s, opacity 0.2s;
+}
+.btn-download:disabled { opacity: 0.3; cursor: not-allowed; pointer-events: none; }
+.btn-download:not(:disabled):hover {
+  background: var(--gold);
+  color: #0a0800;
+  border-color: var(--gold);
+  box-shadow: 0 2px 12px rgba(255,180,50,0.35);
+}
+.btn-download svg { flex-shrink: 0; }
+
+.recorder-notice {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  padding: 0 16px 14px;
+  line-height: 1.6;
+  display: none;
+}
+.recorder-notice.visible { display: block; }
+
+/* ════════════════════════════════
+   RESPONSIVE
+   ════════════════════════════════ */
+@media (max-width: 860px) {
+  .main-grid {
+    grid-template-columns: 1fr;
   }
-  return text.slice(charIndex, end);
+
+  .topbar-version { display: none; }
+
+  .caption-word-el {
+    font-size: clamp(40px, 12vw, 68px);
+  }
+
+  .caption-log { max-height: 140px; }
 }
 
-/**
- * speak
- * Creates and fires a SpeechSynthesisUtterance, wiring up all events.
- */
-function speak() {
-  const text = textInput.value.trim();
+@media (max-width: 480px) {
+  .app { padding: 0 12px 40px; }
+  .topbar { padding: 14px 0 12px; margin-bottom: 16px; }
+  .topbar-logo { font-size: 15px; }
+  .settings-grid { grid-template-columns: 1fr; }
+  .transport { flex-direction: column; }
+  .download-card { flex-wrap: wrap; }
+  .btn-download { width: 100%; justify-content: center; margin-top: 6px; }
 
-  if (!text) {
-    textInput.focus();
-    textInput.style.borderColor = "rgba(255,95,135,0.6)";
-    setTimeout(() => (textInput.style.borderColor = ""), 1200);
-    return;
-  }
-
-  // Cancel anything in progress first
-  window.speechSynthesis.cancel();
-
-  // Small delay lets cancel() fully flush before starting (fixes Chrome bug)
-  setTimeout(() => {
-    totalChars = text.length;
-
-    const utterance = new SpeechSynthesisUtterance(text);
-
-    // ── Voice ──
-    const selectedVoiceName = voiceSelect.value;
-    if (selectedVoiceName) {
-      const voice = voices.find(v => v.name === selectedVoiceName);
-      if (voice) utterance.voice = voice;
-    }
-
-    // ── Rate & Pitch ──
-    utterance.rate  = parseFloat(rateSlider.value);
-    utterance.pitch = parseFloat(pitchSlider.value);
-
-    // ── Events ──
-
-    utterance.onstart = () => {
-      setStateLive();
-    };
-
-    /**
-     * onboundary fires at word (and sentence) boundaries.
-     * charIndex = position in the string where the current word starts.
-     * We use this to extract the exact word and display it.
-     */
-    utterance.onboundary = (event) => {
-      // Only handle word boundaries (not sentence boundaries)
-      if (event.name !== "word") return;
-
-      const { charIndex } = event;
-      const word = extractWordAtCharIndex(text, charIndex);
-
-      if (word) {
-        showWord(word);
-        updateProgress(charIndex);
-      }
-    };
-
-    utterance.onend = () => {
-      setStateDone();
-      // Fade out the last caption word after a short pause
-      setTimeout(() => {
-        captionWord.classList.add("fade-out");
-        setTimeout(showIdle, 300);
-      }, 900);
-    };
-
-    utterance.onerror = (event) => {
-      // 'canceled' is a normal error when we call cancel() ourselves — ignore it
-      if (event.error === "canceled" || event.error === "interrupted") return;
-
-      console.error("SpeechSynthesis error:", event.error);
-      setStateIdle("Error");
-      showIdle();
-    };
-
-    window.speechSynthesis.speak(utterance);
-
-    /**
-     * Chrome has a known bug where speechSynthesis pauses after ~15s.
-     * We work around it by calling resume() periodically.
-     * We clear the interval once speech ends.
-     */
-    const resumeInterval = setInterval(() => {
-      if (!window.speechSynthesis.speaking) {
-        clearInterval(resumeInterval);
-      } else if (window.speechSynthesis.paused) {
-        window.speechSynthesis.resume();
-      }
-    }, 5000);
-
-    // Store so we can clear on manual stop
-    speakBtn._resumeInterval = resumeInterval;
-
-  }, 80);
+  .caption-stage { min-height: 160px; padding: 16px; }
+  .caption-word-el { font-size: clamp(36px, 14vw, 58px); }
 }
 
-/**
- * stop
- * Cancels ongoing speech and resets UI.
- */
-function stop() {
-  window.speechSynthesis.cancel();
-  clearInterval(speakBtn._resumeInterval);
-  setStateIdle("Stopped");
-  showIdle();
-  progressFill.style.width = "0%";
-}
-
-// ── Button click handler ──────────────────────────────────────────────────────
-speakBtn.addEventListener("click", () => {
-  if (isSpeaking) {
-    stop();
-  } else {
-    speak();
-  }
-});
-
-// ── Cancel speech when page becomes hidden (tab switch, minimize) ─────────────
-document.addEventListener("visibilitychange", () => {
-  if (document.hidden && isSpeaking) {
-    stop();
-  }
-});
-
-// ── Keyboard shortcut: Space to speak/stop (when textarea not focused) ────────
-document.addEventListener("keydown", (e) => {
-  if (e.target === textInput) return;           // don't intercept textarea typing
-  if (e.code === "Space" && !e.repeat) {
-    e.preventDefault();
-    speakBtn.click();
-  }
-});
-
-// ── Init ──────────────────────────────────────────────────────────────────────
-showIdle();
-charCount.textContent = textInput.value.length;
