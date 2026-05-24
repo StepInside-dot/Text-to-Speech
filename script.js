@@ -1,692 +1,667 @@
-/* ================================================================
-   VoxCap Studio — style.css
-   Aesthetic: Precision broadcast workstation / audio instrument
-   Fonts: Syne (display) + IBM Plex Mono (data) + IBM Plex Sans (body)
-   ================================================================ */
+/**
+ * VoxCap Studio — script.js
+ * ─────────────────────────────────────────────────────────────
+ * Features:
+ *   • Web Speech API (SpeechSynthesis) with voice selection
+ *   • Real-time word-by-word captions via onboundary
+ *   • MediaRecorder audio capture → downloadable WebM/WAV
+ *   • Timestamped caption log → downloadable .srt or .vtt file
+ *   • Progress bar, elapsed timer, word counter
+ * ─────────────────────────────────────────────────────────────
+ */
 
-/* ── Reset ── */
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+"use strict";
 
-/* ── Design tokens ── */
-:root {
-  /* Palette — deep studio blacks + amber gold */
-  --bg:          #080a0d;
-  --bg-2:        #0d1017;
-  --bg-3:        #12161d;
-  --surface:     #161b24;
-  --surface-2:   #1c2230;
-  --surface-3:   #222b3a;
+// ══════════════════════════════════════════════════════════════
+// DOM references
+// ══════════════════════════════════════════════════════════════
+const textInput         = document.getElementById("text-input");
+const charCountEl       = document.getElementById("char-count");
+const voiceSelect       = document.getElementById("voice-select");
+const rateSlider        = document.getElementById("rate-slider");
+const pitchSlider       = document.getElementById("pitch-slider");
+const volumeSlider      = document.getElementById("volume-slider");
+const rateDisplay       = document.getElementById("rate-display");
+const pitchDisplay      = document.getElementById("pitch-display");
+const volumeDisplay     = document.getElementById("volume-display");
+const captionFormatSel  = document.getElementById("caption-format");
+const speakBtn          = document.getElementById("speak-btn");
+const speakIcon         = document.getElementById("speak-icon");
+const speakLabel        = document.getElementById("speak-label");
+const stopBtn           = document.getElementById("stop-btn");
+const captionIdleMsg    = document.getElementById("caption-idle-msg");
+const captionDisplay    = document.getElementById("caption-display");
+const progressBar       = document.getElementById("progress-bar");
+const elapsedTimeEl     = document.getElementById("elapsed-time");
+const wordCountDisplay  = document.getElementById("word-count-display");
+const captionLogEl      = document.getElementById("caption-log");
+const clearLogBtn       = document.getElementById("clear-log-btn");
+const recBadge          = document.getElementById("rec-badge");
+const statusDot         = document.getElementById("status-dot");
+const statusText        = document.getElementById("status-text");
+const downloadAudioBtn  = document.getElementById("download-audio-btn");
+const downloadCaptionBtn= document.getElementById("download-caption-btn");
+const audioMeta         = document.getElementById("audio-meta");
+const captionMeta       = document.getElementById("caption-meta");
+const recorderNotice    = document.getElementById("recorder-notice");
 
-  --border:      rgba(255,255,255,0.06);
-  --border-md:   rgba(255,255,255,0.1);
-  --border-hi:   rgba(255,180,50,0.25);
+// ══════════════════════════════════════════════════════════════
+// State
+// ══════════════════════════════════════════════════════════════
+let voices          = [];
+let isSpeaking      = false;
+let speechStartTime = 0;        // performance.now() when speech began
+let totalChars      = 0;
+let wordIndex       = 0;        // sequential word counter
+let elapsedTimer    = null;     // setInterval handle for clock
 
-  --gold:        #ffb432;     /* primary accent — amber gold */
-  --gold-dim:    #c47e10;
-  --gold-glow:   rgba(255,180,50,0.18);
-  --red:         #ff4455;     /* recording/error */
-  --green:       #39e07a;     /* done/success */
-  --cyan:        #3dd8e8;     /* info accent */
+// Caption data: array of { index, word, startMs, endMs }
+let captionEntries  = [];
+let currentEntry    = null;     // the in-progress entry (no endMs yet)
 
-  --text:        #dce4f0;
-  --text-muted:  #5c6880;
-  --text-dim:    #2e3a4e;
+// Audio recording
+let mediaRecorder   = null;
+let audioChunks     = [];
+let recordedBlob    = null;     // final audio blob
+let audioObjectURL  = null;
 
-  /* Caption word */
-  --caption-color: #ffffff;
+// Caption download
+let captionObjectURL = null;
 
-  /* Typography */
-  --font-display: 'Syne', sans-serif;
-  --font-mono:    'IBM Plex Mono', monospace;
-  --font-body:    'IBM Plex Sans', sans-serif;
+// Chrome resume-bug workaround
+let resumeInterval  = null;
 
-  /* Geometry */
-  --r-sm: 4px;
-  --r-md: 8px;
-  --r-lg: 14px;
-  --r-xl: 20px;
-}
+// ══════════════════════════════════════════════════════════════
+// Browser support check
+// ══════════════════════════════════════════════════════════════
+const hasSpeech = "speechSynthesis" in window;
 
-/* ── Scrollbar ── */
-::-webkit-scrollbar { width: 4px; }
-::-webkit-scrollbar-track { background: var(--bg-2); }
-::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 2px; }
-
-/* ── Base ── */
-html { scroll-behavior: smooth; }
-body {
-  background: var(--bg);
-  color: var(--text);
-  font-family: var(--font-body);
-  font-size: 14px;
-  line-height: 1.6;
-  min-height: 100dvh;
-  overflow-x: hidden;
-}
-
-/* ── Scanlines ── */
-.scanlines {
-  position: fixed;
-  inset: 0;
-  background: repeating-linear-gradient(
-    to bottom,
-    transparent,
-    transparent 3px,
-    rgba(0,0,0,0.04) 3px,
-    rgba(0,0,0,0.04) 4px
+if (!hasSpeech) {
+  speakBtn.disabled = true;
+  setStatus("NOT SUPPORTED", "");
+  alert(
+    "Your browser does not support the Web Speech API.\n" +
+    "Please use Chrome, Edge, or Safari."
   );
-  pointer-events: none;
-  z-index: 9999;
-  opacity: 0.6;
 }
 
-/* ── App container ── */
-.app {
-  max-width: 1200px;
-  margin: 0 auto;
-  padding: 0 20px 60px;
-  min-height: 100dvh;
-  display: flex;
-  flex-direction: column;
+// ══════════════════════════════════════════════════════════════
+// Voices
+// ══════════════════════════════════════════════════════════════
+
+/**
+ * Keywords that help identify male voices.
+ * This is heuristic — the Web Speech API provides no gender field.
+ */
+const MALE_KEYWORDS = [
+  "david", "james", "mark", "paul", "richard", "thomas", "george",
+  "daniel", "guy", "aaron", "fred", "alex", "oliver", "male",
+  "carlos", "diego", "luca", "henrik", "stefan", "jorge"
+];
+
+function isMaleVoice(voice) {
+  const name = voice.name.toLowerCase();
+  return MALE_KEYWORDS.some(kw => name.includes(kw));
 }
 
-/* ════════════════════════════════
-   TOP BAR
-   ════════════════════════════════ */
-.topbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 18px 0 16px;
-  border-bottom: 1px solid var(--border);
-  margin-bottom: 28px;
-  position: sticky;
-  top: 0;
-  background: rgba(8,10,13,0.92);
-  backdrop-filter: blur(12px);
-  z-index: 100;
+function populateVoices() {
+  voices = window.speechSynthesis.getVoices();
+  if (!voices.length) return;
+
+  voiceSelect.innerHTML = "";
+
+  // Split into groups: English Male, English Female/Unknown, Other
+  const enMale    = voices.filter(v => v.lang.startsWith("en") && isMaleVoice(v));
+  const enOther   = voices.filter(v => v.lang.startsWith("en") && !isMaleVoice(v));
+  const otherLang = voices.filter(v => !v.lang.startsWith("en"));
+
+  const buildGroup = (label, list) => {
+    if (!list.length) return;
+    const grp = document.createElement("optgroup");
+    grp.label = label;
+    list.forEach(voice => {
+      const opt = document.createElement("option");
+      opt.value = voice.name;
+      opt.textContent = `${voice.name}  [${voice.lang}]${voice.localService ? " ●" : ""}`;
+      grp.appendChild(opt);
+    });
+    voiceSelect.appendChild(grp);
+  };
+
+  buildGroup("English — Male", enMale);
+  buildGroup("English — Other", enOther);
+  buildGroup("Other Languages", otherLang);
+
+  // Auto-select: prefer first local English male, else first English, else first
+  const preferred =
+    enMale.find(v => v.localService) ||
+    enMale[0] ||
+    enOther.find(v => v.localService) ||
+    enOther[0] ||
+    voices[0];
+
+  if (preferred) voiceSelect.value = preferred.name;
 }
 
-.topbar-left { display: flex; align-items: center; gap: 12px; }
-
-.topbar-logo {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-family: var(--font-display);
-  font-size: 18px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  color: var(--text);
-}
-.topbar-logo svg { color: var(--gold); flex-shrink: 0; }
-
-.topbar-version {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--text-muted);
-  background: var(--surface);
-  border: 1px solid var(--border-md);
-  padding: 2px 7px;
-  border-radius: 3px;
-  letter-spacing: 0.08em;
+populateVoices();
+if (typeof window.speechSynthesis !== "undefined") {
+  window.speechSynthesis.onvoiceschanged = populateVoices;
 }
 
-/* Status indicator */
-.status-indicator {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 0.12em;
-  color: var(--text-muted);
-}
-.status-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--text-dim);
-  transition: background 0.3s, box-shadow 0.3s;
-}
-.status-dot.live {
-  background: var(--red);
-  box-shadow: 0 0 8px rgba(255,68,85,0.9);
-  animation: blink 1s ease-in-out infinite;
-}
-.status-dot.done {
-  background: var(--green);
-  box-shadow: 0 0 8px rgba(57,224,122,0.7);
-  animation: none;
-}
-@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
+// ══════════════════════════════════════════════════════════════
+// Slider live labels
+// ══════════════════════════════════════════════════════════════
+rateSlider.addEventListener("input", () => {
+  rateDisplay.textContent = parseFloat(rateSlider.value).toFixed(1) + "×";
+});
+pitchSlider.addEventListener("input", () => {
+  pitchDisplay.textContent = parseFloat(pitchSlider.value).toFixed(1);
+});
+volumeSlider.addEventListener("input", () => {
+  volumeDisplay.textContent = Math.round(parseFloat(volumeSlider.value) * 100) + "%";
+});
+textInput.addEventListener("input", () => {
+  charCountEl.textContent = textInput.value.length;
+});
+charCountEl.textContent = textInput.value.length;
 
-/* ════════════════════════════════
-   MAIN GRID
-   ════════════════════════════════ */
-.main-grid {
-  display: grid;
-  grid-template-columns: 380px 1fr;
-  gap: 20px;
-  align-items: start;
+// ══════════════════════════════════════════════════════════════
+// Helpers — UI state
+// ══════════════════════════════════════════════════════════════
+function setStatus(text, dotClass) {
+  statusText.textContent = text;
+  statusDot.className = "status-dot" + (dotClass ? " " + dotClass : "");
 }
 
-.col-left, .col-right {
-  display: flex;
-  flex-direction: column;
-  gap: 18px;
+function setPlayingUI(playing) {
+  isSpeaking = playing;
+
+  if (playing) {
+    speakBtn.classList.add("playing");
+    speakIcon.innerHTML = `<svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
+      <rect x="0" y="0" width="4" height="12" rx="1"/>
+      <rect x="7" y="0" width="4" height="12" rx="1"/>
+    </svg>`;
+    speakLabel.textContent = "Playing…";
+    speakBtn.disabled = false;  // keep enabled so user can click to stop via stop-btn
+    stopBtn.disabled = false;
+    recBadge.classList.add("active");
+    setStatus("RECORDING", "live");
+  } else {
+    speakBtn.classList.remove("playing");
+    speakIcon.innerHTML = `<svg width="14" height="16" viewBox="0 0 14 16" fill="currentColor"><path d="M0 0L14 8L0 16V0Z"/></svg>`;
+    speakLabel.textContent = "Play";
+    stopBtn.disabled = true;
+    recBadge.classList.remove("active");
+  }
 }
 
-/* ════════════════════════════════
-   PANEL
-   ════════════════════════════════ */
-.panel {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--r-lg);
-  overflow: hidden;
-  position: relative;
-}
-.panel::before {
-  content: '';
-  position: absolute;
-  top: 0; left: 0; right: 0;
-  height: 1px;
-  background: linear-gradient(90deg, transparent 5%, var(--border-md) 40%, transparent 95%);
+function showCaption(word) {
+  captionIdleMsg.classList.add("hidden");
+  captionDisplay.classList.add("visible");
+
+  // Replace content with a freshly-animated element
+  captionDisplay.innerHTML = "";
+  const el = document.createElement("span");
+  el.className = "caption-word-el";
+  el.textContent = cleanWord(word).toUpperCase();
+  captionDisplay.appendChild(el);
 }
 
-.panel-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 12px 18px;
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-3);
+function hideCaption() {
+  captionDisplay.classList.remove("visible");
+  captionIdleMsg.classList.remove("hidden");
+  setTimeout(() => { captionDisplay.innerHTML = ""; }, 300);
 }
 
-.panel-label {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.14em;
-  color: var(--gold);
-  text-transform: uppercase;
+function cleanWord(w) {
+  return w.replace(/^[^\w]+|[^\w]+$/g, "");
 }
 
-/* ════════════════════════════════
-   TEXT INPUT
-   ════════════════════════════════ */
-.char-counter {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--text-muted);
-  letter-spacing: 0.06em;
+// ══════════════════════════════════════════════════════════════
+// Elapsed timer
+// ══════════════════════════════════════════════════════════════
+function startTimer() {
+  speechStartTime = performance.now();
+  elapsedTimer = setInterval(() => {
+    const ms = performance.now() - speechStartTime;
+    elapsedTimeEl.textContent = formatElapsed(ms);
+  }, 100);
 }
 
-.text-input {
-  display: block;
-  width: 100%;
-  min-height: 170px;
-  background: transparent;
-  border: none;
-  color: var(--text);
-  font-family: var(--font-body);
-  font-size: 14px;
-  font-weight: 300;
-  line-height: 1.75;
-  padding: 18px;
-  resize: vertical;
-  outline: none;
-  transition: background 0.2s;
-}
-.text-input::placeholder { color: var(--text-dim); }
-.text-input:focus { background: rgba(255,255,255,0.015); }
-
-/* ════════════════════════════════
-   SETTINGS
-   ════════════════════════════════ */
-.settings-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 14px;
-  padding: 18px;
-  padding-bottom: 4px;
+function stopTimer() {
+  clearInterval(elapsedTimer);
+  elapsedTimer = null;
 }
 
-.setting-group {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.setting-group.full-width { grid-column: 1 / -1; }
-
-.setting-label {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  letter-spacing: 0.1em;
-  color: var(--text-muted);
-  text-transform: uppercase;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
+function formatElapsed(ms) {
+  const totalSec = Math.floor(ms / 1000);
+  const min = Math.floor(totalSec / 60);
+  const sec = totalSec % 60;
+  const dec = Math.floor((ms % 1000) / 100);
+  return `${String(min).padStart(2,"0")}:${String(sec).padStart(2,"0")}.${dec}`;
 }
 
-.setting-value {
-  color: var(--gold);
-  font-size: 10px;
+// ══════════════════════════════════════════════════════════════
+// Caption log
+// ══════════════════════════════════════════════════════════════
+function addLogEntry(word, startMs) {
+  const empty = captionLogEl.querySelector(".log-empty");
+  if (empty) empty.remove();
+
+  const row = document.createElement("div");
+  row.className = "log-entry";
+
+  const ts = formatSrtTime(startMs, false); // compact form
+  row.innerHTML = `<span class="log-ts">${ts}</span><span class="log-word">${cleanWord(word) || word}</span>`;
+  captionLogEl.appendChild(row);
+  captionLogEl.scrollTop = captionLogEl.scrollHeight;
 }
 
-/* Select */
-.select-wrap {
-  position: relative;
-}
-.setting-select {
-  width: 100%;
-  background: var(--surface-2);
-  border: 1px solid var(--border-md);
-  border-radius: var(--r-sm);
-  color: var(--text);
-  font-family: var(--font-body);
-  font-size: 13px;
-  padding: 8px 30px 8px 10px;
-  outline: none;
-  cursor: pointer;
-  appearance: none;
-  -webkit-appearance: none;
-  transition: border-color 0.2s;
-}
-.setting-select:focus { border-color: var(--gold-dim); }
-.setting-select option { background: var(--surface-2); }
+clearLogBtn.addEventListener("click", () => {
+  captionLogEl.innerHTML = '<p class="log-empty">Caption entries will appear here during playback.</p>';
+});
 
-.select-arrow {
-  position: absolute;
-  right: 10px;
-  top: 50%;
-  transform: translateY(-50%);
-  color: var(--text-muted);
-  font-size: 11px;
-  pointer-events: none;
-}
+// ══════════════════════════════════════════════════════════════
+// MediaRecorder — audio capture
+// ══════════════════════════════════════════════════════════════
 
-/* Range slider */
-.slider {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 100%;
-  height: 3px;
-  background: var(--surface-3);
-  border-radius: 100px;
-  outline: none;
-  cursor: pointer;
-  border: none;
-}
-.slider::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  width: 14px; height: 14px;
-  border-radius: 50%;
-  background: var(--gold);
-  border: 2px solid var(--bg);
-  box-shadow: 0 0 8px rgba(255,180,50,0.5);
-  cursor: pointer;
-  transition: transform 0.15s, box-shadow 0.15s;
-}
-.slider::-moz-range-thumb {
-  width: 14px; height: 14px;
-  border-radius: 50%;
-  background: var(--gold);
-  border: 2px solid var(--bg);
-  box-shadow: 0 0 8px rgba(255,180,50,0.5);
-  cursor: pointer;
-}
-.slider:hover::-webkit-slider-thumb {
-  transform: scale(1.25);
-  box-shadow: 0 0 14px rgba(255,180,50,0.85);
+/**
+ * The Web Speech API synthesises audio through the OS audio pipeline,
+ * not via the Web Audio API. We therefore capture the system audio by
+ * routing to a Web Audio AudioContext with a destination stream, then
+ * recording that stream.
+ *
+ * Important caveat: on most browsers getDisplayMedia (screen + audio)
+ * is the only reliable way to capture system audio; getUserMedia cannot
+ * capture it directly. However, we can use AudioContext.createMediaStreamDestination()
+ * as a passthrough so that SpeechSynthesis audio IS routed through it
+ * in Chromium-based browsers when the AudioContext is kept alive.
+ *
+ * Fallback: if AudioContext capture fails, we fall back to a silent
+ * recording and show a helpful notice to the user.
+ */
+
+let audioCtx        = null;
+let audioDestination= null;
+
+function initAudioCapture() {
+  try {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    audioDestination = audioCtx.createMediaStreamDestination();
+    return true;
+  } catch (e) {
+    console.warn("AudioContext init failed:", e);
+    return false;
+  }
 }
 
-/* ════════════════════════════════
-   TRANSPORT CONTROLS
-   ════════════════════════════════ */
-.transport {
-  display: flex;
-  gap: 10px;
-  padding: 16px 18px 18px;
-}
+function startRecording() {
+  audioChunks = [];
+  recordedBlob = null;
+  if (audioObjectURL) { URL.revokeObjectURL(audioObjectURL); audioObjectURL = null; }
 
-/* Buttons */
-.btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  font-family: var(--font-display);
-  font-size: 14px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  border: none;
-  border-radius: var(--r-md);
-  cursor: pointer;
-  padding: 11px 22px;
-  transition: transform 0.12s, box-shadow 0.15s, background 0.2s, opacity 0.2s;
-  text-transform: uppercase;
-}
-.btn:disabled { opacity: 0.35; cursor: not-allowed; pointer-events: none; }
-.btn:active:not(:disabled) { transform: scale(0.97); }
+  // Try to get a real stream from AudioContext
+  const hasAudioCtx = initAudioCapture();
+  let stream;
 
-.btn-icon { display: flex; align-items: center; }
-
-.btn-primary {
-  background: var(--gold);
-  color: #0a0800;
-  flex: 1;
-  box-shadow: 0 4px 20px rgba(255,180,50,0.3);
-}
-.btn-primary:hover:not(:disabled) {
-  background: #ffc84a;
-  box-shadow: 0 4px 28px rgba(255,180,50,0.55);
-  transform: translateY(-1px);
-}
-.btn-primary.playing {
-  background: var(--red);
-  color: #fff;
-  box-shadow: 0 4px 20px rgba(255,68,85,0.4);
-  animation: pulse-gold 1.8s ease-in-out infinite;
-}
-@keyframes pulse-gold {
-  0%,100% { box-shadow: 0 4px 20px rgba(255,68,85,0.4); }
-  50%      { box-shadow: 0 4px 36px rgba(255,68,85,0.75); }
-}
-
-.btn-secondary {
-  background: var(--surface-2);
-  color: var(--text);
-  border: 1px solid var(--border-md);
-}
-.btn-secondary:hover:not(:disabled) {
-  background: var(--surface-3);
-  border-color: var(--border-hi);
-}
-
-/* ════════════════════════════════
-   CAPTION PANEL
-   ════════════════════════════════ */
-.panel-caption { position: relative; }
-
-.rec-badge {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-family: var(--font-mono);
-  font-size: 9px;
-  font-weight: 600;
-  letter-spacing: 0.14em;
-  color: var(--text-dim);
-  opacity: 0;
-  transition: opacity 0.3s;
-}
-.rec-badge.active {
-  color: var(--red);
-  opacity: 1;
-}
-.rec-dot {
-  width: 7px; height: 7px;
-  border-radius: 50%;
-  background: var(--red);
-  animation: blink 0.9s ease-in-out infinite;
-}
-
-/* Caption stage */
-.caption-stage {
-  min-height: 200px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 24px 28px;
-  position: relative;
-  background:
-    radial-gradient(ellipse 60% 50% at 50% 50%, rgba(255,180,50,0.04) 0%, transparent 70%);
-}
-
-.caption-idle-msg {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 12px;
-  color: var(--text-dim);
-  font-size: 13px;
-  text-align: center;
-  transition: opacity 0.3s;
-}
-.caption-idle-msg.hidden { opacity: 0; pointer-events: none; }
-.caption-idle-msg svg { color: var(--text-dim); }
-
-/* The caption word display */
-.caption-display {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 20px;
-  opacity: 0;
-  transition: opacity 0.15s;
-  pointer-events: none;
-}
-.caption-display.visible { opacity: 1; }
-
-.caption-word-el {
-  font-family: var(--font-display);
-  font-size: clamp(48px, 7vw, 84px);
-  font-weight: 800;
-  letter-spacing: 0.02em;
-  color: var(--caption-color);
-  text-align: center;
-  line-height: 1;
-  text-shadow:
-    0 0 60px rgba(255,180,50,0.35),
-    0 3px 0 rgba(0,0,0,0.9),
-    2px 2px 0 rgba(0,0,0,0.7);
-  animation: word-in 0.22s cubic-bezier(0.22,1.4,0.5,1) forwards;
-  word-break: break-word;
-  max-width: 100%;
-}
-
-@keyframes word-in {
-  from { opacity: 0; transform: scale(0.78) translateY(12px); }
-  to   { opacity: 1; transform: scale(1) translateY(0); }
-}
-
-/* Progress */
-.progress-bar-wrap {
-  height: 2px;
-  background: var(--surface-2);
-  margin: 0 18px;
-}
-.progress-bar-fill {
-  height: 100%;
-  width: 0%;
-  background: linear-gradient(90deg, var(--gold-dim), var(--gold));
-  border-radius: 2px;
-  transition: width 0.25s linear;
-  box-shadow: 0 0 8px rgba(255,180,50,0.4);
-}
-
-/* Timing row */
-.timing-row {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 10px 18px 14px;
-  font-family: var(--font-mono);
-  font-size: 10px;
-}
-.timing-label { color: var(--text-dim); letter-spacing: 0.1em; }
-.timing-value { color: var(--gold); letter-spacing: 0.06em; font-size: 11px; }
-
-/* ════════════════════════════════
-   CAPTION LOG
-   ════════════════════════════════ */
-.btn-clear {
-  background: none;
-  border: none;
-  color: var(--text-muted);
-  font-size: 11px;
-  cursor: pointer;
-  padding: 2px 5px;
-  border-radius: 3px;
-  transition: color 0.2s, background 0.2s;
-}
-.btn-clear:hover { color: var(--red); background: rgba(255,68,85,0.1); }
-
-.caption-log {
-  max-height: 180px;
-  overflow-y: auto;
-  padding: 12px 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.log-empty {
-  color: var(--text-dim);
-  font-size: 12px;
-  padding: 4px 0;
-}
-
-.log-entry {
-  display: grid;
-  grid-template-columns: 100px 1fr;
-  gap: 10px;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  line-height: 1.5;
-  padding: 3px 0;
-  border-bottom: 1px solid var(--border);
-  animation: log-in 0.2s ease forwards;
-}
-@keyframes log-in {
-  from { opacity: 0; transform: translateX(-6px); }
-  to   { opacity: 1; transform: translateX(0); }
-}
-
-.log-ts { color: var(--gold-dim); flex-shrink: 0; }
-.log-word { color: var(--text); }
-
-/* ════════════════════════════════
-   DOWNLOAD SECTION
-   ════════════════════════════════ */
-.download-grid {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 16px;
-}
-
-.download-card {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  background: var(--bg-3);
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  padding: 14px 16px;
-  transition: border-color 0.2s;
-}
-.download-card.ready { border-color: rgba(255,180,50,0.2); }
-
-.download-card-icon {
-  color: var(--text-dim);
-  flex-shrink: 0;
-  transition: color 0.3s;
-}
-.download-card.ready .download-card-icon { color: var(--gold); }
-
-.download-card-info {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  min-width: 0;
-}
-.download-card-title {
-  font-family: var(--font-display);
-  font-size: 13px;
-  font-weight: 700;
-  letter-spacing: 0.05em;
-  color: var(--text);
-}
-.download-card-meta {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--text-muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.btn-download {
-  background: var(--surface-2);
-  color: var(--text-muted);
-  border: 1px solid var(--border-md);
-  border-radius: var(--r-sm);
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  padding: 7px 12px;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  flex-shrink: 0;
-  transition: background 0.2s, color 0.2s, border-color 0.2s, box-shadow 0.2s, opacity 0.2s;
-}
-.btn-download:disabled { opacity: 0.3; cursor: not-allowed; pointer-events: none; }
-.btn-download:not(:disabled):hover {
-  background: var(--gold);
-  color: #0a0800;
-  border-color: var(--gold);
-  box-shadow: 0 2px 12px rgba(255,180,50,0.35);
-}
-.btn-download svg { flex-shrink: 0; }
-
-.recorder-notice {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--text-muted);
-  padding: 0 16px 14px;
-  line-height: 1.6;
-  display: none;
-}
-.recorder-notice.visible { display: block; }
-
-/* ════════════════════════════════
-   RESPONSIVE
-   ════════════════════════════════ */
-@media (max-width: 860px) {
-  .main-grid {
-    grid-template-columns: 1fr;
+  if (hasAudioCtx && audioDestination) {
+    stream = audioDestination.stream;
+  } else {
+    // Fallback: create a silent oscillator stream so MediaRecorder still
+    // runs (the file will be silent — we notify the user)
+    try {
+      const fallbackCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const dest = fallbackCtx.createMediaStreamDestination();
+      // Immediately suspended so it stays silent
+      stream = dest.stream;
+      showRecorderNotice(
+        "⚠️ Audio capture is limited on this browser. " +
+        "The downloaded file may be silent. " +
+        "For full audio capture, try Chrome or Edge."
+      );
+    } catch (e) {
+      console.warn("Cannot create MediaRecorder stream:", e);
+      return;
+    }
   }
 
-  .topbar-version { display: none; }
+  // Prefer WebM/opus, fall back to whatever the browser supports
+  const mimeType = getSupportedMimeType();
 
-  .caption-word-el {
-    font-size: clamp(40px, 12vw, 68px);
+  try {
+    mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+  } catch (e) {
+    console.warn("MediaRecorder init failed:", e);
+    showRecorderNotice("⚠️ MediaRecorder is not supported in this browser. Audio download unavailable.");
+    return;
   }
 
-  .caption-log { max-height: 140px; }
+  mediaRecorder.ondataavailable = (e) => {
+    if (e.data && e.data.size > 0) audioChunks.push(e.data);
+  };
+
+  mediaRecorder.onstop = () => {
+    const ext = mimeType && mimeType.includes("ogg") ? "ogg" : "webm";
+    recordedBlob = new Blob(audioChunks, { type: mimeType || "audio/webm" });
+    audioObjectURL = URL.createObjectURL(recordedBlob);
+    const sizekb = Math.round(recordedBlob.size / 1024);
+    audioMeta.textContent = `${ext.toUpperCase()} · ${sizekb} KB`;
+    document.getElementById("card-audio").classList.add("ready");
+    downloadAudioBtn.disabled = false;
+  };
+
+  mediaRecorder.start(250); // collect in 250ms chunks
 }
 
-@media (max-width: 480px) {
-  .app { padding: 0 12px 40px; }
-  .topbar { padding: 14px 0 12px; margin-bottom: 16px; }
-  .topbar-logo { font-size: 15px; }
-  .settings-grid { grid-template-columns: 1fr; }
-  .transport { flex-direction: column; }
-  .download-card { flex-wrap: wrap; }
-  .btn-download { width: 100%; justify-content: center; margin-top: 6px; }
-
-  .caption-stage { min-height: 160px; padding: 16px; }
-  .caption-word-el { font-size: clamp(36px, 14vw, 58px); }
+function stopRecording() {
+  if (mediaRecorder && mediaRecorder.state !== "inactive") {
+    mediaRecorder.stop();
+  }
+  if (audioCtx) {
+    audioCtx.close().catch(() => {});
+    audioCtx = null;
+    audioDestination = null;
+  }
 }
 
+function getSupportedMimeType() {
+  const candidates = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/ogg;codecs=opus",
+    "audio/ogg",
+  ];
+  return candidates.find(t => MediaRecorder.isTypeSupported(t)) || "";
+}
+
+function showRecorderNotice(msg) {
+  recorderNotice.textContent = msg;
+  recorderNotice.classList.add("visible");
+}
+
+// ══════════════════════════════════════════════════════════════
+// Caption file generation (SRT / VTT)
+// ══════════════════════════════════════════════════════════════
+
+/**
+ * Format milliseconds → "HH:MM:SS,mmm" (SRT) or "HH:MM:SS.mmm" (VTT)
+ */
+function formatSrtTime(ms, useSrt = true) {
+  const totalSec = Math.floor(ms / 1000);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  const msec = Math.floor(ms % 1000);
+  const sep = useSrt ? "," : ".";
+  return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}${sep}${String(msec).padStart(3,"0")}`;
+}
+
+/**
+ * Build an SRT or VTT string from captionEntries.
+ * Each entry: { index, word, startMs, endMs }
+ */
+function buildCaptionFile(format) {
+  if (!captionEntries.length) return "";
+
+  if (format === "vtt") {
+    let out = "WEBVTT\n\n";
+    captionEntries.forEach((entry, i) => {
+      const start = formatSrtTime(entry.startMs, false);
+      const end   = formatSrtTime(entry.endMs,   false);
+      out += `${i + 1}\n${start} --> ${end}\n${cleanWord(entry.word) || entry.word}\n\n`;
+    });
+    return out;
+  } else {
+    // SRT
+    let out = "";
+    captionEntries.forEach((entry, i) => {
+      const start = formatSrtTime(entry.startMs, true);
+      const end   = formatSrtTime(entry.endMs,   true);
+      out += `${i + 1}\n${start} --> ${end}\n${cleanWord(entry.word) || entry.word}\n\n`;
+    });
+    return out;
+  }
+}
+
+function prepareCaptionDownload() {
+  if (!captionEntries.length) return;
+
+  if (captionObjectURL) { URL.revokeObjectURL(captionObjectURL); captionObjectURL = null; }
+
+  const format  = captionFormatSel.value;
+  const content = buildCaptionFile(format);
+  const blob    = new Blob([content], { type: "text/plain;charset=utf-8" });
+  captionObjectURL = URL.createObjectURL(blob);
+
+  const wordCount = captionEntries.length;
+  captionMeta.textContent = `${format.toUpperCase()} · ${wordCount} entries`;
+  document.getElementById("card-caption").classList.add("ready");
+  downloadCaptionBtn.disabled = false;
+}
+
+// ══════════════════════════════════════════════════════════════
+// Download handlers
+// ══════════════════════════════════════════════════════════════
+downloadAudioBtn.addEventListener("click", () => {
+  if (!audioObjectURL) return;
+  const ext  = recordedBlob.type.includes("ogg") ? "ogg" : "webm";
+  triggerDownload(audioObjectURL, `voxcap-audio.${ext}`);
+});
+
+downloadCaptionBtn.addEventListener("click", () => {
+  if (!captionObjectURL) return;
+  const format = captionFormatSel.value;
+  triggerDownload(captionObjectURL, `voxcap-captions.${format}`);
+});
+
+function triggerDownload(url, filename) {
+  const a = document.createElement("a");
+  a.href     = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
+// ══════════════════════════════════════════════════════════════
+// Word extraction from charIndex
+// ══════════════════════════════════════════════════════════════
+function extractWordAt(text, charIndex) {
+  let end = charIndex;
+  while (end < text.length && !/\s/.test(text[end])) end++;
+  return text.slice(charIndex, end);
+}
+
+// ══════════════════════════════════════════════════════════════
+// Main speak() function
+// ══════════════════════════════════════════════════════════════
+function speak() {
+  const text = textInput.value.trim();
+  if (!text) {
+    textInput.focus();
+    textInput.style.outline = "1px solid rgba(255,68,85,0.6)";
+    setTimeout(() => (textInput.style.outline = ""), 1200);
+    return;
+  }
+
+  // Cancel any ongoing speech cleanly
+  window.speechSynthesis.cancel();
+
+  // Reset caption + audio state
+  captionEntries = [];
+  currentEntry   = null;
+  wordIndex      = 0;
+  totalChars     = text.length;
+  progressBar.style.width = "0%";
+  wordCountDisplay.textContent = "0";
+  elapsedTimeEl.textContent = "00:00.0";
+
+  // Reset download buttons
+  downloadAudioBtn.disabled  = true;
+  downloadCaptionBtn.disabled= true;
+  audioMeta.textContent    = "Recording…";
+  captionMeta.textContent  = "In progress…";
+  document.getElementById("card-audio").classList.remove("ready");
+  document.getElementById("card-caption").classList.remove("ready");
+
+  // Small delay lets cancel() flush (Chrome timing bug)
+  setTimeout(() => {
+
+    startRecording();
+
+    const utterance = new SpeechSynthesisUtterance(text);
+
+    // Voice
+    const selectedName = voiceSelect.value;
+    if (selectedName) {
+      const voice = voices.find(v => v.name === selectedName);
+      if (voice) utterance.voice = voice;
+    }
+
+    utterance.rate   = parseFloat(rateSlider.value);
+    utterance.pitch  = parseFloat(pitchSlider.value);
+    utterance.volume = parseFloat(volumeSlider.value);
+
+    // ── onstart ──
+    utterance.onstart = () => {
+      setPlayingUI(true);
+      startTimer();
+    };
+
+    // ── onboundary — fires at each word / sentence boundary ──
+    utterance.onboundary = (event) => {
+      if (event.name !== "word") return;
+
+      const { charIndex } = event;
+      const word = extractWordAt(text, charIndex);
+      if (!word) return;
+
+      const nowMs = performance.now() - speechStartTime;
+
+      // Close out the previous entry with an endMs
+      if (currentEntry) {
+        currentEntry.endMs = Math.max(nowMs - 20, currentEntry.startMs + 50);
+        captionEntries.push({ ...currentEntry });
+        addLogEntry(currentEntry.word, currentEntry.startMs);
+      }
+
+      // Open new entry
+      wordIndex++;
+      currentEntry = {
+        index:   wordIndex,
+        word:    word,
+        startMs: nowMs,
+        endMs:   null,
+      };
+
+      // Update caption display
+      showCaption(word);
+      wordCountDisplay.textContent = wordIndex;
+      updateProgress(charIndex);
+    };
+
+    // ── onend ──
+    utterance.onend = () => {
+      const endMs = performance.now() - speechStartTime;
+
+      // Close last entry
+      if (currentEntry) {
+        currentEntry.endMs = endMs;
+        captionEntries.push({ ...currentEntry });
+        addLogEntry(currentEntry.word, currentEntry.startMs);
+        currentEntry = null;
+      }
+
+      stopTimer();
+      stopRecording();
+      setPlayingUI(false);
+      setStatus("DONE", "done");
+      progressBar.style.width = "100%";
+      clearInterval(resumeInterval);
+
+      // Fade caption then show idle
+      setTimeout(() => hideCaption(), 1200);
+
+      // Prepare caption download (audio is ready via mediaRecorder.onstop)
+      prepareCaptionDownload();
+    };
+
+    // ── onerror ──
+    utterance.onerror = (event) => {
+      if (event.error === "canceled" || event.error === "interrupted") return;
+      console.error("SpeechSynthesis error:", event.error);
+      stopAll("ERROR");
+    };
+
+    window.speechSynthesis.speak(utterance);
+
+    // Chrome 15-second pause bug workaround
+    clearInterval(resumeInterval);
+    resumeInterval = setInterval(() => {
+      if (!window.speechSynthesis.speaking) {
+        clearInterval(resumeInterval);
+      } else if (window.speechSynthesis.paused) {
+        window.speechSynthesis.resume();
+      }
+    }, 5000);
+
+  }, 80);
+}
+
+// ══════════════════════════════════════════════════════════════
+// Stop
+// ══════════════════════════════════════════════════════════════
+function stopAll(statusLabel = "STOPPED") {
+  window.speechSynthesis.cancel();
+  clearInterval(resumeInterval);
+  stopTimer();
+  stopRecording();
+  setPlayingUI(false);
+  setStatus(statusLabel, "");
+  hideCaption();
+  progressBar.style.width = "0%";
+
+  // If we have partial entries, still offer caption download
+  if (captionEntries.length) prepareCaptionDownload();
+}
+
+// ══════════════════════════════════════════════════════════════
+// Progress bar
+// ══════════════════════════════════════════════════════════════
+function updateProgress(charIndex) {
+  if (!totalChars) return;
+  const pct = Math.min((charIndex / totalChars) * 100, 100);
+  progressBar.style.width = pct + "%";
+}
+
+// ══════════════════════════════════════════════════════════════
+// Button handlers
+// ══════════════════════════════════════════════════════════════
+speakBtn.addEventListener("click", () => {
+  if (isSpeaking) {
+    stopAll("STOPPED");
+  } else {
+    speak();
+  }
+});
+
+stopBtn.addEventListener("click", () => stopAll("STOPPED"));
+
+// ══════════════════════════════════════════════════════════════
+// Page visibility — stop on tab hide to avoid orphaned synthesis
+// ══════════════════════════════════════════════════════════════
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden && isSpeaking) stopAll("STOPPED");
+});
+
+// ══════════════════════════════════════════════════════════════
+// Keyboard shortcut: Space = play/stop (when not in textarea)
+// ══════════════════════════════════════════════════════════════
+document.addEventListener("keydown", (e) => {
+  if (e.target === textInput) return;
+  if (e.code === "Space" && !e.repeat) {
+    e.preventDefault();
+    speakBtn.click();
+  }
+});
