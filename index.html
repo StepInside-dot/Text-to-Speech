@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VoxCap — Text to Speech</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;500;600&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- Ambient background orbs -->
+  <div class="bg-orb orb-1"></div>
+  <div class="bg-orb orb-2"></div>
+  <div class="bg-orb orb-3"></div>
+
+  <div class="layout">
+
+    <!-- Header -->
+    <header class="header">
+      <div class="logo">
+        <span class="logo-icon">◈</span>
+        <span class="logo-text">VoxCap</span>
+      </div>
+      <div class="badge">Web Speech API</div>
+    </header>
+
+    <!-- Main content -->
+    <main class="main">
+
+      <!-- Input panel -->
+      <section class="input-panel">
+        <label class="input-label" for="text-input">
+          <span class="label-number">01</span>
+          <span>Enter your text</span>
+        </label>
+
+        <div class="textarea-wrapper">
+          <textarea
+            id="text-input"
+            class="text-input"
+            placeholder="Paste or type anything here — a speech, a quote, a story, lyrics..."
+            maxlength="5000"
+            spellcheck="true"
+          >The quick brown fox jumps over the lazy dog. Every word you speak becomes a caption. Watch as each word lights up in real time, perfectly synced to the voice.</textarea>
+          <div class="char-counter"><span id="char-count">178</span> / 5000</div>
+        </div>
+
+        <!-- Controls row -->
+        <div class="controls-row">
+
+          <!-- Voice selector -->
+          <div class="control-group">
+            <label class="control-label" for="voice-select">Voice</label>
+            <select id="voice-select" class="control-select">
+              <option value="">Loading voices…</option>
+            </select>
+          </div>
+
+          <!-- Rate slider -->
+          <div class="control-group">
+            <label class="control-label" for="rate-slider">Speed <span id="rate-value" class="slider-value">1.0×</span></label>
+            <input type="range" id="rate-slider" class="control-slider" min="0.5" max="2" step="0.1" value="1" />
+          </div>
+
+          <!-- Pitch slider -->
+          <div class="control-group">
+            <label class="control-label" for="pitch-slider">Pitch <span id="pitch-value" class="slider-value">1.0</span></label>
+            <input type="range" id="pitch-slider" class="control-slider" min="0.5" max="2" step="0.1" value="1" />
+          </div>
+
+        </div>
+
+        <!-- Speak button -->
+        <button id="speak-btn" class="speak-btn" aria-label="Start speaking">
+          <span class="btn-icon" id="btn-icon">▶</span>
+          <span class="btn-label" id="btn-label">Speak</span>
+          <span class="btn-pulse"></span>
+        </button>
+
+      </section>
+
+      <!-- Caption stage -->
+      <section class="caption-stage" aria-live="polite" aria-label="Live captions">
+        <div class="stage-label">
+          <span class="stage-dot" id="stage-dot"></span>
+          <span id="stage-status">Ready</span>
+        </div>
+
+        <div class="caption-container" id="caption-container">
+          <div class="caption-idle" id="caption-idle">
+            <span class="idle-icon">◈</span>
+            <p>Your words will appear here</p>
+          </div>
+          <div class="caption-word" id="caption-word"></div>
+        </div>
+
+        <!-- Progress bar -->
+        <div class="progress-track">
+          <div class="progress-fill" id="progress-fill"></div>
+        </div>
+
+      </section>
+
+    </main>
+
+    <!-- Footer -->
+    <footer class="footer">
+      <p>Runs entirely in your browser · No data is sent anywhere · <a href="https://developer.mozilla.org/en-US/docs/Web/API/Web_Speech_API" target="_blank" rel="noopener">Web Speech API</a></p>
+    </footer>
+
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
