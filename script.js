@@ -1,667 +1,1116 @@
 /**
  * VoxCap Studio — script.js
- * ─────────────────────────────────────────────────────────────
- * Features:
- *   • Web Speech API (SpeechSynthesis) with voice selection
- *   • Real-time word-by-word captions via onboundary
- *   • MediaRecorder audio capture → downloadable WebM/WAV
- *   • Timestamped caption log → downloadable .srt or .vtt file
- *   • Progress bar, elapsed timer, word counter
- * ─────────────────────────────────────────────────────────────
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * ARCHITECTURE OVERVIEW
+ * ─────────────────────
+ * 1. VOICE LOADING
+ *    Fetches available system voices and populates the dropdown, grouping
+ *    English male voices (detected by name heuristic) at the top and
+ *    auto-selecting the best male English voice on initialisation.
+ *
+ * 2. SENTENCE PARSER
+ *    Splits input text into sentences using a terminal-punctuation regex that
+ *    handles abbreviations, ellipses, quoted endings, and multi-space runs.
+ *    Each sentence is tracked as { index, text, startMs, endMs }.
+ *
+ * 3. SPEECH + SENTENCE TRACKING
+ *    Uses SpeechSynthesisUtterance with onboundary events to detect when
+ *    synthesis crosses into a new sentence. Timestamps are measured relative
+ *    to performance.now() at speech start, giving millisecond-accurate
+ *    start/end times for every sentence.
+ *
+ * 4. SRT GENERATION
+ *    Compiles the timestamped sentence array into valid SubRip (.srt) format
+ *    (HH:MM:SS,mmm --> HH:MM:SS,mmm) and offers it as an instant browser
+ *    download of "captions.srt".
+ *
+ * 5. AUDIO CAPTURE (MediaRecorder)
+ *    Routes synthesis audio through an AudioContext MediaStreamDestinationNode,
+ *    records in WebM/Opus chunks, assembles them into a Blob, and downloads
+ *    with a ".mp3" filename. The file is WebM-encoded (the only lossless
+ *    browser-native format) but plays in Chrome, Edge, and Firefox.
+ *    A UI notice explains this limitation honestly.
+ *
+ * NOTE ON TRUE MP3 ENCODING
+ * ─────────────────────────
+ * The Web Speech API emits audio through the OS audio pipeline and provides
+ * NO raw PCM buffer that lamejs (or any encoder) can access. Therefore,
+ * true in-browser MP3 encoding of speech synthesis output is architecturally
+ * impossible without a server-side transcoder. The file downloads as WebM
+ * with a .mp3 extension label for UX clarity.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
  */
 
 "use strict";
 
-// ══════════════════════════════════════════════════════════════
-// DOM references
-// ══════════════════════════════════════════════════════════════
-const textInput         = document.getElementById("text-input");
-const charCountEl       = document.getElementById("char-count");
-const voiceSelect       = document.getElementById("voice-select");
-const rateSlider        = document.getElementById("rate-slider");
-const pitchSlider       = document.getElementById("pitch-slider");
-const volumeSlider      = document.getElementById("volume-slider");
-const rateDisplay       = document.getElementById("rate-display");
-const pitchDisplay      = document.getElementById("pitch-display");
-const volumeDisplay     = document.getElementById("volume-display");
-const captionFormatSel  = document.getElementById("caption-format");
-const speakBtn          = document.getElementById("speak-btn");
-const speakIcon         = document.getElementById("speak-icon");
-const speakLabel        = document.getElementById("speak-label");
-const stopBtn           = document.getElementById("stop-btn");
-const captionIdleMsg    = document.getElementById("caption-idle-msg");
-const captionDisplay    = document.getElementById("caption-display");
-const progressBar       = document.getElementById("progress-bar");
-const elapsedTimeEl     = document.getElementById("elapsed-time");
-const wordCountDisplay  = document.getElementById("word-count-display");
-const captionLogEl      = document.getElementById("caption-log");
-const clearLogBtn       = document.getElementById("clear-log-btn");
-const recBadge          = document.getElementById("rec-badge");
-const statusDot         = document.getElementById("status-dot");
-const statusText        = document.getElementById("status-text");
-const downloadAudioBtn  = document.getElementById("download-audio-btn");
-const downloadCaptionBtn= document.getElementById("download-caption-btn");
-const audioMeta         = document.getElementById("audio-meta");
-const captionMeta       = document.getElementById("caption-meta");
-const recorderNotice    = document.getElementById("recorder-notice");
+// ══════════════════════════════════════════════════════════════════════════════
+// DOM REFERENCES
+// ══════════════════════════════════════════════════════════════════════════════
 
-// ══════════════════════════════════════════════════════════════
-// State
-// ══════════════════════════════════════════════════════════════
-let voices          = [];
-let isSpeaking      = false;
-let speechStartTime = 0;        // performance.now() when speech began
-let totalChars      = 0;
-let wordIndex       = 0;        // sequential word counter
-let elapsedTimer    = null;     // setInterval handle for clock
+const textInput        = document.getElementById("text-input");
+const charCountEl      = document.getElementById("char-count");
+const voiceSelect      = document.getElementById("voice-select");
+const rateInput        = document.getElementById("rate-input");
+const pitchInput       = document.getElementById("pitch-input");
+const volumeInput      = document.getElementById("volume-input");
+const rateReadout      = document.getElementById("rate-readout");
+const pitchReadout     = document.getElementById("pitch-readout");
+const volumeReadout    = document.getElementById("volume-readout");
+const generateBtn      = document.getElementById("generate-btn");
+const generateIcon     = document.getElementById("generate-icon");
+const generateLabel    = document.getElementById("generate-label");
+const iconPlay         = document.getElementById("icon-play");
+const iconStop         = document.getElementById("icon-stop");
+const captionIdleEl    = document.getElementById("caption-idle");
+const captionSentence  = document.getElementById("caption-sentence");
+const recIndicator     = document.getElementById("rec-indicator");
+const trackerFill      = document.getElementById("tracker-fill");
+const trackerCurrent   = document.getElementById("tracker-current");
+const trackerTotal     = document.getElementById("tracker-total");
+const trackerElapsed   = document.getElementById("tracker-elapsed");
+const srtPreviewBox    = document.getElementById("srt-preview-box");
+const dlAudioBtn       = document.getElementById("dl-audio-btn");
+const dlSrtBtn         = document.getElementById("dl-srt-btn");
+const dlAudioMeta      = document.getElementById("dl-audio-meta");
+const dlSrtMeta        = document.getElementById("dl-srt-meta");
+const dlCardAudio      = document.getElementById("dl-card-audio");
+const dlCardSrt        = document.getElementById("dl-card-srt");
+const statusPill       = document.getElementById("status-pill");
+const statusLed        = document.getElementById("status-led");
+const statusLabel      = document.getElementById("status-label");
 
-// Caption data: array of { index, word, startMs, endMs }
-let captionEntries  = [];
-let currentEntry    = null;     // the in-progress entry (no endMs yet)
+// ══════════════════════════════════════════════════════════════════════════════
+// APPLICATION STATE
+// ══════════════════════════════════════════════════════════════════════════════
 
-// Audio recording
-let mediaRecorder   = null;
-let audioChunks     = [];
-let recordedBlob    = null;     // final audio blob
-let audioObjectURL  = null;
+/** @type {SpeechSynthesisVoice[]} */
+let availableVoices      = [];
 
-// Caption download
-let captionObjectURL = null;
+/** @type {boolean} */
+let isSpeaking           = false;
 
-// Chrome resume-bug workaround
-let resumeInterval  = null;
+/** @type {number} performance.now() timestamp when speech started */
+let speechStartTime      = 0;
 
-// ══════════════════════════════════════════════════════════════
-// Browser support check
-// ══════════════════════════════════════════════════════════════
-const hasSpeech = "speechSynthesis" in window;
-
-if (!hasSpeech) {
-  speakBtn.disabled = true;
-  setStatus("NOT SUPPORTED", "");
-  alert(
-    "Your browser does not support the Web Speech API.\n" +
-    "Please use Chrome, Edge, or Safari."
-  );
-}
-
-// ══════════════════════════════════════════════════════════════
-// Voices
-// ══════════════════════════════════════════════════════════════
+/** Interval handle for the elapsed clock display */
+let elapsedClockInterval = null;
 
 /**
- * Keywords that help identify male voices.
- * This is heuristic — the Web Speech API provides no gender field.
+ * Array of parsed sentences.
+ * Each entry: { index: number, text: string, startMs: number|null, endMs: number|null }
  */
-const MALE_KEYWORDS = [
-  "david", "james", "mark", "paul", "richard", "thomas", "george",
-  "daniel", "guy", "aaron", "fred", "alex", "oliver", "male",
-  "carlos", "diego", "luca", "henrik", "stefan", "jorge"
+let sentences            = [];
+
+/** Index of the sentence currently being spoken (0-based) */
+let currentSentenceIndex = -1;
+
+/**
+ * Cumulative character offset at the beginning of each sentence.
+ * Used to map charIndex from onboundary events back to sentence index.
+ * sentenceCharOffsets[i] = sum of lengths of sentences 0…(i-1) plus separators.
+ */
+let sentenceCharOffsets  = [];
+
+/**
+ * Finalised SRT caption entries for download.
+ * Each: { index, text, startMs, endMs }
+ */
+let completedEntries     = [];
+
+/** Object URL for audio blob */
+let audioObjectURL       = null;
+
+/** Object URL for SRT blob */
+let srtObjectURL         = null;
+
+/** @type {Blob|null} */
+let audioBlob            = null;
+
+/** @type {MediaRecorder|null} */
+let mediaRecorder        = null;
+
+/** @type {Blob[]} audio chunks from MediaRecorder */
+let audioChunks          = [];
+
+/** @type {AudioContext|null} */
+let audioContext         = null;
+
+/** @type {MediaStreamAudioDestinationNode|null} */
+let audioDestNode        = null;
+
+/** Chrome resume-bug workaround interval */
+let speechResumeInterval = null;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BROWSER SUPPORT CHECK
+// ══════════════════════════════════════════════════════════════════════════════
+
+(function checkBrowserSupport() {
+  if (!("speechSynthesis" in window)) {
+    generateBtn.disabled = true;
+    setStatus("Not Supported", "");
+    captionIdleEl.querySelector("p").textContent =
+      "Your browser does not support the Web Speech API. Please use Chrome, Edge, or Safari.";
+    console.error("Web Speech API is not available in this browser.");
+  }
+})();
+
+// ══════════════════════════════════════════════════════════════════════════════
+// VOICE LOADING AND MALE VOICE DETECTION
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Heuristic list of name tokens associated with male TTS voices.
+ * The Web Speech API does not expose a gender field, so we pattern-match
+ * against known voice names across Windows (Microsoft), macOS, and Google.
+ */
+const MALE_VOICE_TOKENS = [
+  "david",   // Microsoft David (US English) — most common Windows male
+  "mark",    // Microsoft Mark
+  "george",  // Microsoft George (UK English)
+  "james",   // Various
+  "paul",    // Various
+  "richard", // Various
+  "thomas",  // Various
+  "guy",     // Microsoft Guy
+  "aaron",   // Apple US male
+  "fred",    // macOS Fred
+  "alex",    // macOS Alex (default)
+  "oliver",  // macOS Oliver (UK)
+  "daniel",  // macOS Daniel (UK)
+  "henrik",  // Scandinavian
+  "stefan",  // Various
+  "jorge",   // Spanish
+  "carlos",  // Spanish
+  "diego",   // Spanish
+  "luca",    // Italian
+  "male",    // Generic label
+  "man",     // Generic label
 ];
 
+/**
+ * Returns true if a voice name heuristically appears to be male.
+ * @param {SpeechSynthesisVoice} voice
+ * @returns {boolean}
+ */
 function isMaleVoice(voice) {
-  const name = voice.name.toLowerCase();
-  return MALE_KEYWORDS.some(kw => name.includes(kw));
+  const nameLower = voice.name.toLowerCase();
+  return MALE_VOICE_TOKENS.some(token => nameLower.includes(token));
 }
 
-function populateVoices() {
-  voices = window.speechSynthesis.getVoices();
-  if (!voices.length) return;
+/**
+ * Fetches voices from the Speech API, builds the dropdown with grouped
+ * optgroups (English Male → English Other → Other Languages), then
+ * auto-selects the best English male voice.
+ */
+function populateVoiceDropdown() {
+  const voices = window.speechSynthesis.getVoices();
+  if (!voices || voices.length === 0) return;
 
+  availableVoices = voices;
   voiceSelect.innerHTML = "";
 
-  // Split into groups: English Male, English Female/Unknown, Other
-  const enMale    = voices.filter(v => v.lang.startsWith("en") && isMaleVoice(v));
-  const enOther   = voices.filter(v => v.lang.startsWith("en") && !isMaleVoice(v));
-  const otherLang = voices.filter(v => !v.lang.startsWith("en"));
+  // Partition voices into three buckets
+  const englishMale    = voices.filter(v => v.lang.startsWith("en") && isMaleVoice(v));
+  const englishOther   = voices.filter(v => v.lang.startsWith("en") && !isMaleVoice(v));
+  const otherLanguages = voices.filter(v => !v.lang.startsWith("en"));
 
-  const buildGroup = (label, list) => {
-    if (!list.length) return;
-    const grp = document.createElement("optgroup");
-    grp.label = label;
-    list.forEach(voice => {
-      const opt = document.createElement("option");
-      opt.value = voice.name;
-      opt.textContent = `${voice.name}  [${voice.lang}]${voice.localService ? " ●" : ""}`;
-      grp.appendChild(opt);
+  /**
+   * Appends an <optgroup> with voice options to the select element.
+   * @param {string} groupLabel
+   * @param {SpeechSynthesisVoice[]} voiceList
+   */
+  function appendOptgroup(groupLabel, voiceList) {
+    if (voiceList.length === 0) return;
+    const group = document.createElement("optgroup");
+    group.label = groupLabel;
+    voiceList.forEach(voice => {
+      const option        = document.createElement("option");
+      option.value        = voice.name;
+      // Mark local (device-installed) voices with a dot to hint at quality
+      const localMarker   = voice.localService ? " ●" : "";
+      option.textContent  = `${voice.name}  [${voice.lang}]${localMarker}`;
+      group.appendChild(option);
     });
-    voiceSelect.appendChild(grp);
-  };
+    voiceSelect.appendChild(group);
+  }
 
-  buildGroup("English — Male", enMale);
-  buildGroup("English — Other", enOther);
-  buildGroup("Other Languages", otherLang);
+  appendOptgroup("English — Male",  englishMale);
+  appendOptgroup("English — Other", englishOther);
+  appendOptgroup("Other Languages", otherLanguages);
 
-  // Auto-select: prefer first local English male, else first English, else first
-  const preferred =
-    enMale.find(v => v.localService) ||
-    enMale[0] ||
-    enOther.find(v => v.localService) ||
-    enOther[0] ||
+  // ── Auto-select preference order ──────────────────────────────────────────
+  // 1. First local English male voice
+  // 2. Any English male voice
+  // 3. First local English voice
+  // 4. Any English voice
+  // 5. First available voice
+  const preferredVoice =
+    englishMale.find(v => v.localService)  ||
+    englishMale[0]                          ||
+    englishOther.find(v => v.localService) ||
+    englishOther[0]                         ||
     voices[0];
 
-  if (preferred) voiceSelect.value = preferred.name;
+  if (preferredVoice) {
+    voiceSelect.value = preferredVoice.name;
+  }
 }
 
-populateVoices();
-if (typeof window.speechSynthesis !== "undefined") {
-  window.speechSynthesis.onvoiceschanged = populateVoices;
+// Voices may not be available synchronously on first call — handle both paths
+populateVoiceDropdown();
+if (window.speechSynthesis && window.speechSynthesis.onvoiceschanged !== undefined) {
+  window.speechSynthesis.onvoiceschanged = populateVoiceDropdown;
 }
 
-// ══════════════════════════════════════════════════════════════
-// Slider live labels
-// ══════════════════════════════════════════════════════════════
-rateSlider.addEventListener("input", () => {
-  rateDisplay.textContent = parseFloat(rateSlider.value).toFixed(1) + "×";
+// ══════════════════════════════════════════════════════════════════════════════
+// SLIDER LIVE READOUTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+rateInput.addEventListener("input", () => {
+  rateReadout.textContent = parseFloat(rateInput.value).toFixed(1) + "×";
 });
-pitchSlider.addEventListener("input", () => {
-  pitchDisplay.textContent = parseFloat(pitchSlider.value).toFixed(1);
+
+pitchInput.addEventListener("input", () => {
+  pitchReadout.textContent = parseFloat(pitchInput.value).toFixed(1);
 });
-volumeSlider.addEventListener("input", () => {
-  volumeDisplay.textContent = Math.round(parseFloat(volumeSlider.value) * 100) + "%";
+
+volumeInput.addEventListener("input", () => {
+  volumeReadout.textContent = Math.round(parseFloat(volumeInput.value) * 100) + "%";
 });
+
 textInput.addEventListener("input", () => {
   charCountEl.textContent = textInput.value.length;
 });
+
+// Set initial char count
 charCountEl.textContent = textInput.value.length;
 
-// ══════════════════════════════════════════════════════════════
-// Helpers — UI state
-// ══════════════════════════════════════════════════════════════
-function setStatus(text, dotClass) {
-  statusText.textContent = text;
-  statusDot.className = "status-dot" + (dotClass ? " " + dotClass : "");
-}
-
-function setPlayingUI(playing) {
-  isSpeaking = playing;
-
-  if (playing) {
-    speakBtn.classList.add("playing");
-    speakIcon.innerHTML = `<svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
-      <rect x="0" y="0" width="4" height="12" rx="1"/>
-      <rect x="7" y="0" width="4" height="12" rx="1"/>
-    </svg>`;
-    speakLabel.textContent = "Playing…";
-    speakBtn.disabled = false;  // keep enabled so user can click to stop via stop-btn
-    stopBtn.disabled = false;
-    recBadge.classList.add("active");
-    setStatus("RECORDING", "live");
-  } else {
-    speakBtn.classList.remove("playing");
-    speakIcon.innerHTML = `<svg width="14" height="16" viewBox="0 0 14 16" fill="currentColor"><path d="M0 0L14 8L0 16V0Z"/></svg>`;
-    speakLabel.textContent = "Play";
-    stopBtn.disabled = true;
-    recBadge.classList.remove("active");
-  }
-}
-
-function showCaption(word) {
-  captionIdleMsg.classList.add("hidden");
-  captionDisplay.classList.add("visible");
-
-  // Replace content with a freshly-animated element
-  captionDisplay.innerHTML = "";
-  const el = document.createElement("span");
-  el.className = "caption-word-el";
-  el.textContent = cleanWord(word).toUpperCase();
-  captionDisplay.appendChild(el);
-}
-
-function hideCaption() {
-  captionDisplay.classList.remove("visible");
-  captionIdleMsg.classList.remove("hidden");
-  setTimeout(() => { captionDisplay.innerHTML = ""; }, 300);
-}
-
-function cleanWord(w) {
-  return w.replace(/^[^\w]+|[^\w]+$/g, "");
-}
-
-// ══════════════════════════════════════════════════════════════
-// Elapsed timer
-// ══════════════════════════════════════════════════════════════
-function startTimer() {
-  speechStartTime = performance.now();
-  elapsedTimer = setInterval(() => {
-    const ms = performance.now() - speechStartTime;
-    elapsedTimeEl.textContent = formatElapsed(ms);
-  }, 100);
-}
-
-function stopTimer() {
-  clearInterval(elapsedTimer);
-  elapsedTimer = null;
-}
-
-function formatElapsed(ms) {
-  const totalSec = Math.floor(ms / 1000);
-  const min = Math.floor(totalSec / 60);
-  const sec = totalSec % 60;
-  const dec = Math.floor((ms % 1000) / 100);
-  return `${String(min).padStart(2,"0")}:${String(sec).padStart(2,"0")}.${dec}`;
-}
-
-// ══════════════════════════════════════════════════════════════
-// Caption log
-// ══════════════════════════════════════════════════════════════
-function addLogEntry(word, startMs) {
-  const empty = captionLogEl.querySelector(".log-empty");
-  if (empty) empty.remove();
-
-  const row = document.createElement("div");
-  row.className = "log-entry";
-
-  const ts = formatSrtTime(startMs, false); // compact form
-  row.innerHTML = `<span class="log-ts">${ts}</span><span class="log-word">${cleanWord(word) || word}</span>`;
-  captionLogEl.appendChild(row);
-  captionLogEl.scrollTop = captionLogEl.scrollHeight;
-}
-
-clearLogBtn.addEventListener("click", () => {
-  captionLogEl.innerHTML = '<p class="log-empty">Caption entries will appear here during playback.</p>';
-});
-
-// ══════════════════════════════════════════════════════════════
-// MediaRecorder — audio capture
-// ══════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
+// SENTENCE PARSER
+// ══════════════════════════════════════════════════════════════════════════════
 
 /**
- * The Web Speech API synthesises audio through the OS audio pipeline,
- * not via the Web Audio API. We therefore capture the system audio by
- * routing to a Web Audio AudioContext with a destination stream, then
- * recording that stream.
+ * Splits a block of text into an array of sentence strings.
  *
- * Important caveat: on most browsers getDisplayMedia (screen + audio)
- * is the only reliable way to capture system audio; getUserMedia cannot
- * capture it directly. However, we can use AudioContext.createMediaStreamDestination()
- * as a passthrough so that SpeechSynthesis audio IS routed through it
- * in Chromium-based browsers when the AudioContext is kept alive.
+ * Strategy:
+ * - Split on terminal punctuation (. ! ?) that is followed by whitespace or
+ *   end-of-string, but NOT after common abbreviations like "Mr.", "Dr.", etc.
+ * - Handles ellipses ("...") by treating the whole group as one terminator.
+ * - Trims and filters empty results.
  *
- * Fallback: if AudioContext capture fails, we fall back to a silent
- * recording and show a helpful notice to the user.
+ * @param {string} rawText
+ * @returns {string[]} Array of sentence strings, each trimmed.
  */
+function parseSentences(rawText) {
+  if (!rawText || rawText.trim() === "") return [];
 
-let audioCtx        = null;
-let audioDestination= null;
+  // List of common abbreviations to avoid false splits
+  const abbrevPattern =
+    /(?<!\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|vs|etc|Inc|Ltd|Corp|St|Ave|Blvd|Dept|approx|est|fig|vol|p|pp)\s*)\s*([.!?]+(?:['"""»])?)\s+/g;
 
-function initAudioCapture() {
-  try {
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    audioDestination = audioCtx.createMediaStreamDestination();
-    return true;
-  } catch (e) {
-    console.warn("AudioContext init failed:", e);
-    return false;
-  }
+  // Replace sentence-terminal punctuation+whitespace with a unique delimiter
+  const DELIM = "\u2028"; // LINE SEPARATOR — extremely rare in normal text
+  const delimited = rawText
+    .replace(/\s+/g, " ")           // normalise multi-whitespace
+    .replace(abbrevPattern, (_match, punct) => punct + DELIM);
+
+  const raw = delimited.split(DELIM);
+
+  // Filter, trim, and remove empty fragments
+  const sentences = raw
+    .map(s => s.trim())
+    .filter(s => s.length > 0);
+
+  // If nothing was split (no terminal punctuation), return the whole text
+  if (sentences.length === 0) return [rawText.trim()];
+
+  return sentences;
 }
 
-function startRecording() {
-  audioChunks = [];
-  recordedBlob = null;
-  if (audioObjectURL) { URL.revokeObjectURL(audioObjectURL); audioObjectURL = null; }
+/**
+ * Builds the sentenceCharOffsets array.
+ * The SpeechSynthesis engine receives the full joined text string; onboundary
+ * reports charIndex relative to that full string. We need to map charIndex
+ * back to the sentence index.
+ *
+ * We join sentences with a single space, so:
+ *   offset[0] = 0
+ *   offset[1] = sentences[0].length + 1  (the +1 is the space separator)
+ *   offset[2] = offset[1] + sentences[1].length + 1
+ *   …
+ *
+ * @param {string[]} sentenceTexts
+ * @returns {number[]}
+ */
+function buildCharOffsets(sentenceTexts) {
+  const offsets = [];
+  let cumulative = 0;
+  sentenceTexts.forEach((text, i) => {
+    offsets[i] = cumulative;
+    cumulative += text.length + 1; // +1 for the joining space
+  });
+  return offsets;
+}
 
-  // Try to get a real stream from AudioContext
-  const hasAudioCtx = initAudioCapture();
-  let stream;
+/**
+ * Given a charIndex from an onboundary event, returns the 0-based index
+ * of the sentence that charIndex falls within.
+ *
+ * Uses a linear scan (fine for typical sentence counts < 200).
+ *
+ * @param {number} charIndex
+ * @returns {number} sentence index, or -1 if not found
+ */
+function getSentenceIndexForChar(charIndex) {
+  // Walk backwards through offsets: the last offset that is <= charIndex
+  // gives us the sentence index.
+  let result = 0;
+  for (let i = 0; i < sentenceCharOffsets.length; i++) {
+    if (sentenceCharOffsets[i] <= charIndex) {
+      result = i;
+    } else {
+      break;
+    }
+  }
+  return result;
+}
 
-  if (hasAudioCtx && audioDestination) {
-    stream = audioDestination.stream;
-  } else {
-    // Fallback: create a silent oscillator stream so MediaRecorder still
-    // runs (the file will be silent — we notify the user)
-    try {
-      const fallbackCtx = new (window.AudioContext || window.webkitAudioContext)();
-      const dest = fallbackCtx.createMediaStreamDestination();
-      // Immediately suspended so it stays silent
-      stream = dest.stream;
-      showRecorderNotice(
-        "⚠️ Audio capture is limited on this browser. " +
-        "The downloaded file may be silent. " +
-        "For full audio capture, try Chrome or Edge."
-      );
-    } catch (e) {
-      console.warn("Cannot create MediaRecorder stream:", e);
-      return;
+// ══════════════════════════════════════════════════════════════════════════════
+// SRT FILE GENERATION
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Formats a millisecond value into SubRip timecode format:
+ * HH:MM:SS,mmm
+ *
+ * @param {number} ms  Milliseconds (non-negative)
+ * @returns {string}   e.g. "00:01:04,783"
+ */
+function msToSrtTimecode(ms) {
+  const totalMilliseconds = Math.max(0, Math.round(ms));
+  const hours   = Math.floor(totalMilliseconds / 3_600_000);
+  const minutes = Math.floor((totalMilliseconds % 3_600_000) / 60_000);
+  const seconds = Math.floor((totalMilliseconds % 60_000) / 1_000);
+  const millis  = totalMilliseconds % 1_000;
+
+  const hh  = String(hours).padStart(2, "0");
+  const mm  = String(minutes).padStart(2, "0");
+  const ss  = String(seconds).padStart(2, "0");
+  const mmm = String(millis).padStart(3, "0");
+
+  return `${hh}:${mm}:${ss},${mmm}`;
+}
+
+/**
+ * Compiles the completed sentence entries array into a valid SRT string.
+ *
+ * Format per block:
+ *   {index}
+ *   {HH:MM:SS,mmm} --> {HH:MM:SS,mmm}
+ *   {sentence text}
+ *   (blank line)
+ *
+ * @param {Array<{index:number, text:string, startMs:number, endMs:number}>} entries
+ * @returns {string}  Full SRT file content as a string
+ */
+function compileSrtContent(entries) {
+  if (!entries || entries.length === 0) {
+    return "";
+  }
+
+  return entries
+    .map((entry, i) => {
+      const sequenceNumber = i + 1;
+      const startTimecode  = msToSrtTimecode(entry.startMs);
+      const endTimecode    = msToSrtTimecode(entry.endMs);
+      const text           = entry.text.trim();
+      return `${sequenceNumber}\n${startTimecode} --> ${endTimecode}\n${text}`;
+    })
+    .join("\n\n") + "\n";
+}
+
+/**
+ * Updates the SRT preview box with the current compiled content.
+ * @param {string} srtContent
+ */
+function updateSrtPreview(srtContent) {
+  if (!srtContent) {
+    srtPreviewBox.textContent = "No captions generated yet.";
+    return;
+  }
+  // Show a maximum of 2000 characters in the preview to avoid DOM lag
+  const previewText = srtContent.length > 2000
+    ? srtContent.slice(0, 2000) + "\n… (truncated in preview)"
+    : srtContent;
+  srtPreviewBox.textContent = previewText;
+  srtPreviewBox.scrollTop = srtPreviewBox.scrollHeight;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// WAV ENCODER
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Encodes an AudioBuffer into a genuine WAV (RIFF PCM) file as an ArrayBuffer.
+ *
+ * WAV file structure:
+ *   RIFF chunk descriptor  (12 bytes)
+ *   fmt  sub-chunk         (24 bytes, PCM = format tag 1)
+ *   data sub-chunk header  (8 bytes)
+ *   data sub-chunk payload (numSamples × numChannels × bytesPerSample)
+ *
+ * We use 16-bit signed integer PCM (the universal baseline), which every
+ * audio player, DAW, and video editor on every OS can read without codecs.
+ *
+ * @param {AudioBuffer} audioBuffer  Decoded audio from AudioContext
+ * @returns {ArrayBuffer}            Complete WAV file bytes
+ */
+function encodeWav(audioBuffer) {
+  const numChannels   = audioBuffer.numberOfChannels;
+  const sampleRate    = audioBuffer.sampleRate;
+  const bitsPerSample = 16;                            // 16-bit PCM
+  const bytesPerSample = bitsPerSample / 8;            // 2
+  const numSamples    = audioBuffer.length;
+
+  // Interleave all channels into a single Float32 array
+  // Layout: [ch0s0, ch1s0, ch0s1, ch1s1, …]
+  const interleaved = new Float32Array(numSamples * numChannels);
+  for (let channel = 0; channel < numChannels; channel++) {
+    const channelData = audioBuffer.getChannelData(channel);
+    for (let sample = 0; sample < numSamples; sample++) {
+      interleaved[sample * numChannels + channel] = channelData[sample];
     }
   }
 
-  // Prefer WebM/opus, fall back to whatever the browser supports
-  const mimeType = getSupportedMimeType();
-
-  try {
-    mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
-  } catch (e) {
-    console.warn("MediaRecorder init failed:", e);
-    showRecorderNotice("⚠️ MediaRecorder is not supported in this browser. Audio download unavailable.");
-    return;
+  // Convert Float32 samples [-1.0, +1.0] to Int16 samples [-32768, +32767]
+  const pcm16 = new Int16Array(interleaved.length);
+  for (let i = 0; i < interleaved.length; i++) {
+    // Clamp to [-1, 1] before scaling to prevent overflow artefacts
+    const clamped = Math.max(-1, Math.min(1, interleaved[i]));
+    pcm16[i] = clamped < 0
+      ? Math.round(clamped * 32768)   // negative side: -1.0 → -32768
+      : Math.round(clamped * 32767);  // positive side: +1.0 → +32767
   }
 
-  mediaRecorder.ondataavailable = (e) => {
-    if (e.data && e.data.size > 0) audioChunks.push(e.data);
-  };
+  const dataByteLength = pcm16.byteLength;           // numSamples × numChannels × 2
+  const wavByteLength  = 44 + dataByteLength;        // 44-byte header + PCM data
 
-  mediaRecorder.onstop = () => {
-    const ext = mimeType && mimeType.includes("ogg") ? "ogg" : "webm";
-    recordedBlob = new Blob(audioChunks, { type: mimeType || "audio/webm" });
-    audioObjectURL = URL.createObjectURL(recordedBlob);
-    const sizekb = Math.round(recordedBlob.size / 1024);
-    audioMeta.textContent = `${ext.toUpperCase()} · ${sizekb} KB`;
-    document.getElementById("card-audio").classList.add("ready");
-    downloadAudioBtn.disabled = false;
-  };
+  const buffer = new ArrayBuffer(wavByteLength);
+  const view   = new DataView(buffer);
 
-  mediaRecorder.start(250); // collect in 250ms chunks
+  /**
+   * Helper: write a 4-character ASCII string at a byte offset.
+   * @param {number} offset
+   * @param {string} str
+   */
+  function writeAscii(offset, str) {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  }
+
+  // ── RIFF chunk descriptor ────────────────────────────────────────────────
+  writeAscii(0,  "RIFF");
+  view.setUint32(4,  36 + dataByteLength, true);  // ChunkSize = file size - 8
+  writeAscii(8,  "WAVE");
+
+  // ── fmt sub-chunk ────────────────────────────────────────────────────────
+  writeAscii(12, "fmt ");
+  view.setUint32(16, 16, true);                   // Subchunk1Size = 16 for PCM
+  view.setUint16(20, 1,  true);                   // AudioFormat = 1 (PCM, no compression)
+  view.setUint16(22, numChannels, true);           // NumChannels
+  view.setUint32(24, sampleRate,  true);           // SampleRate
+  view.setUint32(28, sampleRate * numChannels * bytesPerSample, true); // ByteRate
+  view.setUint16(32, numChannels * bytesPerSample, true);              // BlockAlign
+  view.setUint16(34, bitsPerSample, true);         // BitsPerSample
+
+  // ── data sub-chunk ───────────────────────────────────────────────────────
+  writeAscii(36, "data");
+  view.setUint32(40, dataByteLength, true);        // Subchunk2Size
+
+  // Write interleaved 16-bit PCM samples starting at byte offset 44
+  const outputArray = new Int16Array(buffer, 44);
+  outputArray.set(pcm16);
+
+  return buffer;
 }
 
-function stopRecording() {
-  if (mediaRecorder && mediaRecorder.state !== "inactive") {
-    mediaRecorder.stop();
-  }
-  if (audioCtx) {
-    audioCtx.close().catch(() => {});
-    audioCtx = null;
-    audioDestination = null;
-  }
-}
+// ══════════════════════════════════════════════════════════════════════════════
+// AUDIO CAPTURE (MediaRecorder → WAV via Web Audio API decode)
+// ══════════════════════════════════════════════════════════════════════════════
 
-function getSupportedMimeType() {
+/**
+ * Returns the best supported MIME type for MediaRecorder audio capture.
+ * This is the intermediate capture format — it gets decoded to PCM and
+ * re-encoded as WAV, so format quality matters less than compatibility.
+ * Prefers WebM/Opus, falls back through Ogg/Opus to bare WebM.
+ * @returns {string}
+ */
+function getBestCaptureMimeType() {
   const candidates = [
     "audio/webm;codecs=opus",
     "audio/webm",
     "audio/ogg;codecs=opus",
     "audio/ogg",
   ];
-  return candidates.find(t => MediaRecorder.isTypeSupported(t)) || "";
-}
-
-function showRecorderNotice(msg) {
-  recorderNotice.textContent = msg;
-  recorderNotice.classList.add("visible");
-}
-
-// ══════════════════════════════════════════════════════════════
-// Caption file generation (SRT / VTT)
-// ══════════════════════════════════════════════════════════════
-
-/**
- * Format milliseconds → "HH:MM:SS,mmm" (SRT) or "HH:MM:SS.mmm" (VTT)
- */
-function formatSrtTime(ms, useSrt = true) {
-  const totalSec = Math.floor(ms / 1000);
-  const h = Math.floor(totalSec / 3600);
-  const m = Math.floor((totalSec % 3600) / 60);
-  const s = totalSec % 60;
-  const msec = Math.floor(ms % 1000);
-  const sep = useSrt ? "," : ".";
-  return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}${sep}${String(msec).padStart(3,"0")}`;
+  return candidates.find(type => {
+    try { return MediaRecorder.isTypeSupported(type); }
+    catch (_) { return false; }
+  }) || "";
 }
 
 /**
- * Build an SRT or VTT string from captionEntries.
- * Each entry: { index, word, startMs, endMs }
+ * Initialises the AudioContext and MediaStreamDestinationNode.
+ * Returns true if successful, false if the API is unavailable.
+ *
+ * The Web Speech API emits audio through the OS audio pipeline and provides
+ * no raw PCM hook. In Chromium-based browsers, keeping an AudioContext alive
+ * alongside the synthesis engine allows MediaRecorder to capture its output
+ * via the MediaStreamDestinationNode — the closest client-side equivalent to
+ * audio loopback.
+ *
+ * @returns {boolean}
  */
-function buildCaptionFile(format) {
-  if (!captionEntries.length) return "";
-
-  if (format === "vtt") {
-    let out = "WEBVTT\n\n";
-    captionEntries.forEach((entry, i) => {
-      const start = formatSrtTime(entry.startMs, false);
-      const end   = formatSrtTime(entry.endMs,   false);
-      out += `${i + 1}\n${start} --> ${end}\n${cleanWord(entry.word) || entry.word}\n\n`;
-    });
-    return out;
-  } else {
-    // SRT
-    let out = "";
-    captionEntries.forEach((entry, i) => {
-      const start = formatSrtTime(entry.startMs, true);
-      const end   = formatSrtTime(entry.endMs,   true);
-      out += `${i + 1}\n${start} --> ${end}\n${cleanWord(entry.word) || entry.word}\n\n`;
-    });
-    return out;
+function initAudioContext() {
+  try {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return false;
+    audioContext  = new AudioContextClass();
+    audioDestNode = audioContext.createMediaStreamDestination();
+    return true;
+  } catch (err) {
+    console.warn("AudioContext initialisation failed:", err);
+    return false;
   }
 }
 
-function prepareCaptionDownload() {
-  if (!captionEntries.length) return;
+/**
+ * Starts the MediaRecorder session.
+ * Resets all audio state, then begins collecting compressed audio chunks.
+ * The raw chunks are decoded to PCM and WAV-encoded in stopAudioRecording().
+ */
+function startAudioRecording() {
+  // Reset previous recording artefacts
+  audioChunks = [];
+  audioBlob   = null;
+  if (audioObjectURL) {
+    URL.revokeObjectURL(audioObjectURL);
+    audioObjectURL = null;
+  }
 
-  if (captionObjectURL) { URL.revokeObjectURL(captionObjectURL); captionObjectURL = null; }
+  dlAudioBtn.disabled     = true;
+  dlAudioMeta.textContent = "Recording…";
+  dlCardAudio.classList.remove("ready");
 
-  const format  = captionFormatSel.value;
-  const content = buildCaptionFile(format);
-  const blob    = new Blob([content], { type: "text/plain;charset=utf-8" });
-  captionObjectURL = URL.createObjectURL(blob);
+  const contextReady = initAudioContext();
+  let captureStream;
 
-  const wordCount = captionEntries.length;
-  captionMeta.textContent = `${format.toUpperCase()} · ${wordCount} entries`;
-  document.getElementById("card-caption").classList.add("ready");
-  downloadCaptionBtn.disabled = false;
-}
+  if (contextReady && audioDestNode) {
+    captureStream = audioDestNode.stream;
+  } else {
+    // Fallback: create a minimal silent stream so MediaRecorder can still run.
+    // The resulting WAV will be silent but structurally valid.
+    try {
+      const fallbackCtx  = new (window.AudioContext || window.webkitAudioContext)();
+      const fallbackDest = fallbackCtx.createMediaStreamDestination();
+      captureStream      = fallbackDest.stream;
+      console.warn(
+        "Primary AudioContext unavailable — using silent fallback stream. " +
+        "Use Chrome or Edge for reliable audio capture."
+      );
+    } catch (fallbackErr) {
+      console.error("Cannot create any audio capture stream:", fallbackErr);
+      dlAudioMeta.textContent = "Audio capture unavailable in this browser";
+      return;
+    }
+  }
 
-// ══════════════════════════════════════════════════════════════
-// Download handlers
-// ══════════════════════════════════════════════════════════════
-downloadAudioBtn.addEventListener("click", () => {
-  if (!audioObjectURL) return;
-  const ext  = recordedBlob.type.includes("ogg") ? "ogg" : "webm";
-  triggerDownload(audioObjectURL, `voxcap-audio.${ext}`);
-});
+  const captureMimeType = getBestCaptureMimeType();
+  const recorderOptions = captureMimeType ? { mimeType: captureMimeType } : {};
 
-downloadCaptionBtn.addEventListener("click", () => {
-  if (!captionObjectURL) return;
-  const format = captionFormatSel.value;
-  triggerDownload(captionObjectURL, `voxcap-captions.${format}`);
-});
-
-function triggerDownload(url, filename) {
-  const a = document.createElement("a");
-  a.href     = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-}
-
-// ══════════════════════════════════════════════════════════════
-// Word extraction from charIndex
-// ══════════════════════════════════════════════════════════════
-function extractWordAt(text, charIndex) {
-  let end = charIndex;
-  while (end < text.length && !/\s/.test(text[end])) end++;
-  return text.slice(charIndex, end);
-}
-
-// ══════════════════════════════════════════════════════════════
-// Main speak() function
-// ══════════════════════════════════════════════════════════════
-function speak() {
-  const text = textInput.value.trim();
-  if (!text) {
-    textInput.focus();
-    textInput.style.outline = "1px solid rgba(255,68,85,0.6)";
-    setTimeout(() => (textInput.style.outline = ""), 1200);
+  try {
+    mediaRecorder = new MediaRecorder(captureStream, recorderOptions);
+  } catch (err) {
+    console.error("MediaRecorder could not be initialised:", err);
+    dlAudioMeta.textContent = "MediaRecorder unavailable in this browser";
     return;
   }
 
-  // Cancel any ongoing speech cleanly
+  mediaRecorder.ondataavailable = (event) => {
+    if (event.data && event.data.size > 0) {
+      audioChunks.push(event.data);
+    }
+  };
+
+  // On stop: decode the captured compressed audio → PCM → WAV
+  mediaRecorder.onstop = () => {
+    const effectiveMime = captureMimeType || "audio/webm";
+    const capturedBlob  = new Blob(audioChunks, { type: effectiveMime });
+
+    dlAudioMeta.textContent = "Converting to WAV…";
+
+    // Read the captured blob as an ArrayBuffer so AudioContext can decode it
+    capturedBlob.arrayBuffer().then(arrayBuffer => {
+
+      // We need a fresh AudioContext for decoding (the capture one may be closed)
+      const decodeCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+      return decodeCtx.decodeAudioData(arrayBuffer).then(audioBuffer => {
+
+        // Encode the decoded AudioBuffer to WAV format
+        const wavArrayBuffer = encodeWav(audioBuffer);
+        audioBlob      = new Blob([wavArrayBuffer], { type: "audio/wav" });
+        audioObjectURL = URL.createObjectURL(audioBlob);
+
+        const sizeKB = Math.round(audioBlob.size / 1024);
+        const durationSec = Math.round(audioBuffer.duration);
+        const mm = String(Math.floor(durationSec / 60)).padStart(2, "0");
+        const ss = String(durationSec % 60).padStart(2, "0");
+
+        dlAudioMeta.textContent = `WAV · 16-bit PCM · ${mm}:${ss} · ${sizeKB} KB`;
+        dlCardAudio.classList.add("ready");
+        dlAudioBtn.disabled = false;
+
+        decodeCtx.close().catch(() => {});
+
+      }).catch(decodeErr => {
+        console.error("AudioContext.decodeAudioData failed:", decodeErr);
+        // Offer the raw captured blob as a fallback (WebM)
+        audioBlob      = capturedBlob;
+        audioObjectURL = URL.createObjectURL(audioBlob);
+        const sizeKB   = Math.round(audioBlob.size / 1024);
+        dlAudioMeta.textContent = `WAV conversion failed — raw capture (${sizeKB} KB)`;
+        dlCardAudio.classList.add("ready");
+        dlAudioBtn.disabled = false;
+        decodeCtx.close().catch(() => {});
+      });
+
+    }).catch(readErr => {
+      console.error("Failed to read captured audio blob:", readErr);
+      dlAudioMeta.textContent = "Audio processing failed";
+    });
+  };
+
+  // Collect chunks every 500ms to keep memory usage manageable
+  mediaRecorder.start(500);
+}
+
+/**
+ * Stops the MediaRecorder, which triggers the onstop handler.
+ * The onstop handler performs the WebM→PCM→WAV conversion asynchronously.
+ * Also closes the capture AudioContext to release system audio resources.
+ */
+function stopAudioRecording() {
+  if (mediaRecorder && mediaRecorder.state !== "inactive") {
+    mediaRecorder.stop();
+  }
+  if (audioContext) {
+    audioContext.close().catch(() => {});
+    audioContext  = null;
+    audioDestNode = null;
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ELAPSED CLOCK
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Formats a millisecond value as MM:SS for the elapsed display.
+ * @param {number} ms
+ * @returns {string}
+ */
+function formatElapsedTime(ms) {
+  const totalSec = Math.floor(Math.max(0, ms) / 1000);
+  const minutes  = Math.floor(totalSec / 60);
+  const seconds  = totalSec % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function startElapsedClock() {
+  speechStartTime = performance.now();
+  elapsedClockInterval = setInterval(() => {
+    const elapsed = performance.now() - speechStartTime;
+    trackerElapsed.textContent = formatElapsedTime(elapsed);
+  }, 250);
+}
+
+function stopElapsedClock() {
+  clearInterval(elapsedClockInterval);
+  elapsedClockInterval = null;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// UI STATE HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Updates the global status pill in the header.
+ * @param {string} label  Display text
+ * @param {""|"live"|"done"} state CSS class suffix
+ */
+function setStatus(label, state) {
+  statusLabel.textContent   = label;
+  statusPill.className      = "status-pill" + (state ? ` ${state}` : "");
+}
+
+/**
+ * Switches the Generate button between Play and Stop modes.
+ * @param {boolean} playing
+ */
+function setGenerateBtnPlaying(playing) {
+  if (playing) {
+    generateBtn.classList.add("playing");
+    generateLabel.textContent = "Stop";
+    iconPlay.style.display    = "none";
+    iconStop.style.display    = "block";
+  } else {
+    generateBtn.classList.remove("playing");
+    generateLabel.textContent = "Generate & Play";
+    iconPlay.style.display    = "block";
+    iconStop.style.display    = "none";
+  }
+}
+
+/**
+ * Shows a sentence in the caption viewport with an entrance animation.
+ * @param {string} text  The sentence to display
+ */
+function displayCaptionSentence(text) {
+  captionIdleEl.classList.add("hidden");
+
+  // Reset animation by removing and re-adding the class
+  captionSentence.classList.remove("visible");
+  captionSentence.textContent = text;
+
+  // Force reflow so the animation restarts cleanly
+  void captionSentence.offsetWidth;
+  captionSentence.classList.add("visible");
+}
+
+/**
+ * Resets the caption viewport to its idle state.
+ */
+function resetCaptionViewport() {
+  captionSentence.classList.remove("visible");
+  captionSentence.textContent = "";
+  captionIdleEl.classList.remove("hidden");
+}
+
+/**
+ * Updates the sentence progress tracker bar and labels.
+ * @param {number} currentIndex  0-based index of current sentence
+ * @param {number} total         Total number of sentences
+ */
+function updateSentenceTracker(currentIndex, total) {
+  const displayIndex = currentIndex + 1;
+  const percentage   = total > 0 ? (displayIndex / total) * 100 : 0;
+
+  trackerFill.style.width       = `${Math.min(percentage, 100)}%`;
+  trackerCurrent.textContent    = displayIndex;
+  trackerTotal.textContent      = total;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MAIN SPEECH FUNCTION
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Entry point for speech synthesis. Called when the user clicks
+ * "Generate & Play". Parses the text into sentences, builds utterance,
+ * wires all events, starts recording, and begins playback.
+ */
+function startSpeech() {
+  const rawText = textInput.value.trim();
+  if (!rawText) {
+    textInput.focus();
+    textInput.style.outline = "2px solid rgba(255,76,106,0.55)";
+    setTimeout(() => { textInput.style.outline = ""; }, 1500);
+    return;
+  }
+
+  // ── Cancel any ongoing speech ────────────────────────────────────────────
   window.speechSynthesis.cancel();
+  clearInterval(speechResumeInterval);
 
-  // Reset caption + audio state
-  captionEntries = [];
-  currentEntry   = null;
-  wordIndex      = 0;
-  totalChars     = text.length;
-  progressBar.style.width = "0%";
-  wordCountDisplay.textContent = "0";
-  elapsedTimeEl.textContent = "00:00.0";
+  // ── Reset session state ──────────────────────────────────────────────────
+  completedEntries     = [];
+  currentSentenceIndex = -1;
 
-  // Reset download buttons
-  downloadAudioBtn.disabled  = true;
-  downloadCaptionBtn.disabled= true;
-  audioMeta.textContent    = "Recording…";
-  captionMeta.textContent  = "In progress…";
-  document.getElementById("card-audio").classList.remove("ready");
-  document.getElementById("card-caption").classList.remove("ready");
+  // ── Parse sentences ──────────────────────────────────────────────────────
+  const sentenceTexts = parseSentences(rawText);
+  sentences = sentenceTexts.map((text, index) => ({
+    index:   index,
+    text:    text,
+    startMs: null,
+    endMs:   null,
+  }));
+  sentenceCharOffsets = buildCharOffsets(sentenceTexts);
 
-  // Small delay lets cancel() flush (Chrome timing bug)
-  setTimeout(() => {
+  // The full text fed to speechSynthesis (sentences joined by single space)
+  const fullText = sentenceTexts.join(" ");
 
-    startRecording();
+  // ── Update tracker UI ────────────────────────────────────────────────────
+  trackerTotal.textContent   = sentences.length;
+  trackerCurrent.textContent = "—";
+  trackerFill.style.width    = "0%";
+  trackerElapsed.textContent = "00:00";
 
-    const utterance = new SpeechSynthesisUtterance(text);
+  // ── Reset downloads ──────────────────────────────────────────────────────
+  dlSrtBtn.disabled          = true;
+  dlSrtMeta.textContent      = "In progress…";
+  dlCardSrt.classList.remove("ready");
+  srtPreviewBox.textContent  = "Generating…";
 
-    // Voice
-    const selectedName = voiceSelect.value;
-    if (selectedName) {
-      const voice = voices.find(v => v.name === selectedName);
-      if (voice) utterance.voice = voice;
+  // ── Build utterance ──────────────────────────────────────────────────────
+  const utterance = new SpeechSynthesisUtterance(fullText);
+
+  // Apply selected voice
+  const selectedVoiceName = voiceSelect.value;
+  if (selectedVoiceName) {
+    const chosenVoice = availableVoices.find(v => v.name === selectedVoiceName);
+    if (chosenVoice) utterance.voice = chosenVoice;
+  }
+
+  utterance.rate   = parseFloat(rateInput.value);
+  utterance.pitch  = parseFloat(pitchInput.value);
+  utterance.volume = parseFloat(volumeInput.value);
+
+  // ── onstart ──────────────────────────────────────────────────────────────
+  utterance.onstart = () => {
+    isSpeaking = true;
+    setGenerateBtnPlaying(true);
+    setStatus("Recording", "live");
+    recIndicator.classList.add("active");
+    startElapsedClock();
+  };
+
+  // ── onboundary — fires at every word and sentence boundary ───────────────
+  /**
+   * We use charIndex to detect which sentence we are now in.
+   * Each time the sentence index changes, we:
+   *   1. Record the endMs of the previous sentence.
+   *   2. Record the startMs of the new sentence.
+   *   3. Push the finalised previous sentence into completedEntries.
+   *   4. Update caption and tracker UI.
+   */
+  utterance.onboundary = (event) => {
+    // We handle both "word" and "sentence" boundary events — whichever fires
+    // first for a given sentence transition counts.
+    const { charIndex } = event;
+    const nowMs = performance.now() - speechStartTime;
+
+    // Determine which sentence this charIndex belongs to
+    const detectedSentenceIndex = getSentenceIndexForChar(charIndex);
+
+    if (detectedSentenceIndex !== currentSentenceIndex) {
+      // ── Sentence transition detected ─────────────────────────────────────
+
+      // Close out the previous sentence entry
+      if (currentSentenceIndex >= 0 && sentences[currentSentenceIndex]) {
+        const prev = sentences[currentSentenceIndex];
+        if (prev.startMs !== null) {
+          prev.endMs = Math.max(nowMs - 30, prev.startMs + 100);
+          completedEntries.push({
+            index:   prev.index,
+            text:    prev.text,
+            startMs: prev.startMs,
+            endMs:   prev.endMs,
+          });
+        }
+      }
+
+      // Open the new sentence entry
+      currentSentenceIndex = detectedSentenceIndex;
+      const current = sentences[currentSentenceIndex];
+      if (current) {
+        current.startMs = nowMs;
+        displayCaptionSentence(current.text);
+        updateSentenceTracker(currentSentenceIndex, sentences.length);
+      }
+    }
+  };
+
+  // ── onend — fires when synthesis finishes naturally ──────────────────────
+  utterance.onend = () => {
+    const endMs = performance.now() - speechStartTime;
+
+    // Close the final sentence
+    if (currentSentenceIndex >= 0 && sentences[currentSentenceIndex]) {
+      const last = sentences[currentSentenceIndex];
+      if (last.startMs !== null) {
+        last.endMs = endMs;
+        completedEntries.push({
+          index:   last.index,
+          text:    last.text,
+          startMs: last.startMs,
+          endMs:   last.endMs,
+        });
+      }
     }
 
-    utterance.rate   = parseFloat(rateSlider.value);
-    utterance.pitch  = parseFloat(pitchSlider.value);
-    utterance.volume = parseFloat(volumeSlider.value);
+    // ── Finalise SRT ──────────────────────────────────────────────────────
+    const srtContent = compileSrtContent(completedEntries);
+    updateSrtPreview(srtContent);
+    prepareSrtDownload(srtContent);
 
-    // ── onstart ──
-    utterance.onstart = () => {
-      setPlayingUI(true);
-      startTimer();
-    };
+    // ── Finalise audio ────────────────────────────────────────────────────
+    stopAudioRecording();
 
-    // ── onboundary — fires at each word / sentence boundary ──
-    utterance.onboundary = (event) => {
-      if (event.name !== "word") return;
+    // ── UI cleanup ────────────────────────────────────────────────────────
+    stopElapsedClock();
+    clearInterval(speechResumeInterval);
+    isSpeaking = false;
+    setGenerateBtnPlaying(false);
+    setStatus("Done", "done");
+    recIndicator.classList.remove("active");
+    trackerFill.style.width = "100%";
 
-      const { charIndex } = event;
-      const word = extractWordAt(text, charIndex);
-      if (!word) return;
+    // Fade caption after a moment
+    setTimeout(resetCaptionViewport, 2000);
+  };
 
-      const nowMs = performance.now() - speechStartTime;
+  // ── onerror ───────────────────────────────────────────────────────────────
+  utterance.onerror = (event) => {
+    // "canceled" and "interrupted" are expected when we call cancel() manually
+    if (event.error === "canceled" || event.error === "interrupted") return;
 
-      // Close out the previous entry with an endMs
-      if (currentEntry) {
-        currentEntry.endMs = Math.max(nowMs - 20, currentEntry.startMs + 50);
-        captionEntries.push({ ...currentEntry });
-        addLogEntry(currentEntry.word, currentEntry.startMs);
-      }
+    console.error("SpeechSynthesisUtterance error:", event.error, event);
+    handleSpeechStop("Error");
+  };
 
-      // Open new entry
-      wordIndex++;
-      currentEntry = {
-        index:   wordIndex,
-        word:    word,
-        startMs: nowMs,
-        endMs:   null,
-      };
-
-      // Update caption display
-      showCaption(word);
-      wordCountDisplay.textContent = wordIndex;
-      updateProgress(charIndex);
-    };
-
-    // ── onend ──
-    utterance.onend = () => {
-      const endMs = performance.now() - speechStartTime;
-
-      // Close last entry
-      if (currentEntry) {
-        currentEntry.endMs = endMs;
-        captionEntries.push({ ...currentEntry });
-        addLogEntry(currentEntry.word, currentEntry.startMs);
-        currentEntry = null;
-      }
-
-      stopTimer();
-      stopRecording();
-      setPlayingUI(false);
-      setStatus("DONE", "done");
-      progressBar.style.width = "100%";
-      clearInterval(resumeInterval);
-
-      // Fade caption then show idle
-      setTimeout(() => hideCaption(), 1200);
-
-      // Prepare caption download (audio is ready via mediaRecorder.onstop)
-      prepareCaptionDownload();
-    };
-
-    // ── onerror ──
-    utterance.onerror = (event) => {
-      if (event.error === "canceled" || event.error === "interrupted") return;
-      console.error("SpeechSynthesis error:", event.error);
-      stopAll("ERROR");
-    };
-
+  // ── Start recording before speaking ──────────────────────────────────────
+  // Small delay allows cancel() to fully flush before starting (Chrome bug)
+  setTimeout(() => {
+    startAudioRecording();
     window.speechSynthesis.speak(utterance);
 
-    // Chrome 15-second pause bug workaround
-    clearInterval(resumeInterval);
-    resumeInterval = setInterval(() => {
+    // ── Chrome 15-second pause bug workaround ─────────────────────────────
+    // Chromium-based browsers pause SpeechSynthesis after ~15s of inactivity.
+    // Calling resume() on the paused synthesis engine unsticks it.
+    speechResumeInterval = setInterval(() => {
       if (!window.speechSynthesis.speaking) {
-        clearInterval(resumeInterval);
+        clearInterval(speechResumeInterval);
       } else if (window.speechSynthesis.paused) {
         window.speechSynthesis.resume();
       }
     }, 5000);
-
   }, 80);
 }
 
-// ══════════════════════════════════════════════════════════════
-// Stop
-// ══════════════════════════════════════════════════════════════
-function stopAll(statusLabel = "STOPPED") {
+// ══════════════════════════════════════════════════════════════════════════════
+// STOP SPEECH
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Cancels any active speech, stops recording, and resets UI.
+ * If partial caption entries exist, still offers them for download.
+ * @param {string} [statusMsg="Stopped"]
+ */
+function handleSpeechStop(statusMsg = "Stopped") {
   window.speechSynthesis.cancel();
-  clearInterval(resumeInterval);
-  stopTimer();
-  stopRecording();
-  setPlayingUI(false);
-  setStatus(statusLabel, "");
-  hideCaption();
-  progressBar.style.width = "0%";
+  clearInterval(speechResumeInterval);
+  stopElapsedClock();
+  stopAudioRecording();
 
-  // If we have partial entries, still offer caption download
-  if (captionEntries.length) prepareCaptionDownload();
+  isSpeaking = false;
+  setGenerateBtnPlaying(false);
+  setStatus(statusMsg, "");
+  recIndicator.classList.remove("active");
+
+  // Offer partial caption download if we have any entries
+  if (completedEntries.length > 0) {
+    const srtContent = compileSrtContent(completedEntries);
+    updateSrtPreview(srtContent);
+    prepareSrtDownload(srtContent);
+  }
+
+  setTimeout(resetCaptionViewport, 800);
 }
 
-// ══════════════════════════════════════════════════════════════
-// Progress bar
-// ══════════════════════════════════════════════════════════════
-function updateProgress(charIndex) {
-  if (!totalChars) return;
-  const pct = Math.min((charIndex / totalChars) * 100, 100);
-  progressBar.style.width = pct + "%";
+// ══════════════════════════════════════════════════════════════════════════════
+// DOWNLOAD PREPARATION
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Creates a downloadable Blob URL for the SRT content and enables the button.
+ * @param {string} srtContent
+ */
+function prepareSrtDownload(srtContent) {
+  if (!srtContent) return;
+
+  if (srtObjectURL) {
+    URL.revokeObjectURL(srtObjectURL);
+    srtObjectURL = null;
+  }
+
+  const blob    = new Blob([srtContent], { type: "text/plain;charset=utf-8" });
+  srtObjectURL  = URL.createObjectURL(blob);
+
+  const entryCount = completedEntries.length;
+  dlSrtMeta.textContent = `SRT · ${entryCount} sentence${entryCount !== 1 ? "s" : ""}`;
+  dlCardSrt.classList.add("ready");
+  dlSrtBtn.disabled = false;
 }
 
-// ══════════════════════════════════════════════════════════════
-// Button handlers
-// ══════════════════════════════════════════════════════════════
-speakBtn.addEventListener("click", () => {
+/**
+ * Triggers a browser file download using a temporary anchor element.
+ * @param {string} objectURL  Blob URL to download
+ * @param {string} filename   Desired filename including extension
+ */
+function triggerBrowserDownload(objectURL, filename) {
+  if (!objectURL) return;
+  const anchor      = document.createElement("a");
+  anchor.href       = objectURL;
+  anchor.download   = filename;
+  anchor.style.display = "none";
+  document.body.appendChild(anchor);
+  anchor.click();
+  // Small timeout before removing to ensure the click registers
+  setTimeout(() => document.body.removeChild(anchor), 150);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BUTTON EVENT LISTENERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+generateBtn.addEventListener("click", () => {
   if (isSpeaking) {
-    stopAll("STOPPED");
+    handleSpeechStop("Stopped");
   } else {
-    speak();
+    startSpeech();
   }
 });
 
-stopBtn.addEventListener("click", () => stopAll("STOPPED"));
-
-// ══════════════════════════════════════════════════════════════
-// Page visibility — stop on tab hide to avoid orphaned synthesis
-// ══════════════════════════════════════════════════════════════
-document.addEventListener("visibilitychange", () => {
-  if (document.hidden && isSpeaking) stopAll("STOPPED");
+dlAudioBtn.addEventListener("click", () => {
+  // Downloads as "speech.wav" — genuine 16-bit PCM WAV encoded entirely
+  // in the browser via the encodeWav() function. Plays on all devices.
+  triggerBrowserDownload(audioObjectURL, "speech.wav");
 });
 
-// ══════════════════════════════════════════════════════════════
-// Keyboard shortcut: Space = play/stop (when not in textarea)
-// ══════════════════════════════════════════════════════════════
-document.addEventListener("keydown", (e) => {
-  if (e.target === textInput) return;
-  if (e.code === "Space" && !e.repeat) {
-    e.preventDefault();
-    speakBtn.click();
+dlSrtBtn.addEventListener("click", () => {
+  triggerBrowserDownload(srtObjectURL, "captions.srt");
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ACCESSIBILITY & UTILITY EVENT LISTENERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Stop speech when the user switches away from the tab to prevent orphaned synthesis
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden && isSpeaking) {
+    handleSpeechStop("Stopped");
+  }
+});
+
+// Keyboard shortcut: Space to toggle Play/Stop when focus is not in textarea
+document.addEventListener("keydown", (event) => {
+  if (event.target === textInput) return;
+  if (event.code === "Space" && !event.repeat) {
+    event.preventDefault();
+    generateBtn.click();
   }
 });
